@@ -1,0 +1,4 @@
+[submodule "external/networktools"]
+	path = external/networktools
+	url = git@github.com:basti-c3/networktools.git
+	branch = roadef-solver
