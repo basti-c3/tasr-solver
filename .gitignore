@@ -1,0 +1,31 @@
+# Build directories
+build/
+build-*/
+x64/
+
+# Visual Studio
+.vs/
+
+# Solver output
+out/
+
+# CMake generated files
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+compile_commands.json
+
+# Compiled files
+*.exe
+*.dll
+*.lib
+*.a
+*.o
+*.obj
+*.pdb
+
+# Solver-generated models / solutions
+*.lp
+*.mps
+*.sol
+*.log
