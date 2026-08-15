@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <csignal>
 #include <limits>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -17,7 +18,8 @@ enum class SolverType {
 
 enum class VariableType {
     Continuous,
-    Integer
+    Integer,
+    Binary
 };
 
 struct SparseRow {
@@ -45,7 +47,7 @@ public:
                   double upper,
                   VariableType type = VariableType::Continuous);
 
-    void addRow(std::string name,
+    int addRow(std::string name,
                 double lower,
                 double upper,
                 std::vector<int> index,
@@ -93,6 +95,29 @@ bool solverIsCompiled(SolverType type) noexcept;
 void requestInterrupt() noexcept;
 void clearInterrupt() noexcept;
 bool interruptRequested() noexcept;
+
+
+class SolverSession {
+public:
+    virtual ~SolverSession() = default;
+
+    virtual SolverResult optimize(
+        const BackendOptions& options,
+        const MipStart* mip_start = nullptr,
+        const std::string& model_file = {}) = 0;
+
+    virtual void setColumnBounds(int column, double lower, double upper) = 0;
+    virtual void setObjectiveCoefficient(int column, double value) = 0;
+    virtual void setRowBounds(int row, double lower, double upper) = 0;
+    virtual void setCoefficient(int row, int column, double value) = 0;
+
+    virtual std::size_t numColumns() const noexcept = 0;
+    virtual std::size_t numRows() const noexcept = 0;
+};
+
+std::unique_ptr<SolverSession> createSolverSession(
+    SolverType type,
+    const LinearModel& model);
 
 SolverResult solveModel(SolverType type,
                         const LinearModel& model,

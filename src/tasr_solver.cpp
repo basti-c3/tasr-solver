@@ -10,6 +10,7 @@
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <memory>
 #include <numeric>
 #include <optional>
 #include <sstream>
@@ -21,6 +22,7 @@
 namespace {
     constexpr double kTolerance = 1e-7;
     constexpr double kFixingTolerance = 1e-9;
+    constexpr double kLexFixingTolerance = 1e-7;
     constexpr double kInf = std::numeric_limits<double>::infinity();
 
     using opt::BackendOptions;
@@ -39,6 +41,8 @@ namespace {
         std::vector<int> x;       // [d,t,i,j], -1 if unavailable / i==j
         std::vector<int> lambda;  // [t,a], -1 if arc down
         std::vector<int> y;       // [d,t,i,j], only t>=1 and union exists
+        std::vector<int> load_row; // [t,a], row for capacity*lambda - traffic
+        std::vector<int> max_row;  // [t,a], persistent z >= lambda row
         // In models k >= 2, alpha/beta are indexed directly by the
         // lexicographic iteration number. Indices 0 and 1 remain unused:
         // iteration 1 is represented by the max-load constraints.
@@ -64,6 +68,14 @@ namespace {
         std::vector<double> x; // [d,i,j]
         std::vector<double> loads; // all available [t,a] loads
         double max_load = kInf;
+    };
+
+    // A load that has been proved unavoidable at one lexicographic level.
+    // Once proved, lambda[t,a] can be fixed to this value in all later models.
+    struct FixedLoad {
+        int time = -1;
+        int arc = -1;
+        double value = 0.0;
     };
 
     struct CommonRoutingLayout {
@@ -115,6 +127,28 @@ namespace {
     }
 
 
+    std::optional<double> fixedLoadValue(
+        const std::vector<FixedLoad>& fixed_loads,
+        int time,
+        int arc) {
+
+        for (const FixedLoad& fixed : fixed_loads) {
+            if (fixed.time == time && fixed.arc == arc) {
+                return fixed.value;
+            }
+        }
+        return std::nullopt;
+    }
+
+    bool loadIsFixed(
+        const std::vector<FixedLoad>& fixed_loads,
+        int time,
+        int arc) {
+
+        return fixedLoadValue(fixed_loads, time, arc).has_value();
+    }
+
+
     void appendTerm(std::vector<int>& indices,
         std::vector<double>& values,
         int column,
@@ -163,7 +197,10 @@ namespace {
         const InstanceData& instance,
         const SplitCoefficients& splits,
         Layout& layout,
-        double max_load_cutoff = kInf) {
+        double segment_pruning_cutoff = kInf,
+        double free_load_upper_bound = kInf,
+        const std::vector<FixedLoad>& fixed_loads = {}) {
+
         layout.demands = instance.numDemands();
         layout.times = instance.num_time_slots;
         layout.nodes = instance.numNodes();
@@ -175,6 +212,8 @@ namespace {
         layout.x.assign(segment_count, -1);
         layout.y.assign(segment_count, -1);
         layout.lambda.assign(static_cast<std::size_t>(layout.times) * layout.arcs, -1);
+        layout.load_row.assign(static_cast<std::size_t>(layout.times) * layout.arcs, -1);
+        layout.max_row.assign(static_cast<std::size_t>(layout.times) * layout.arcs, -1);
 
         for (int d = 0; d < layout.demands; ++d) {
             for (int t = 0; t < layout.times; ++t) {
@@ -182,13 +221,15 @@ namespace {
                     for (int j = 0; j < layout.nodes; ++j) {
                         if (!segmentIsReachable(splits, t, i, j)) continue;
 
-                        // If x[d,t,i,j] = 1 would by itself force an arc load
-                        // strictly above the best known first-objective bound,
-                        // this variable can safely be fixed to zero.
-                        if (std::isfinite(max_load_cutoff) &&
+                        // This pruning must use a valid upper bound for the GLOBAL
+                        // maximum load (normally z1), not the progressively smaller
+                        // bound for the still-unfixed loads. A segment may legitimately
+                        // contribute more than the current free-load boundary to a
+                        // previously fixed bottleneck.
+                        if (std::isfinite(segment_pruning_cutoff) &&
                             segmentLoadLowerBound(
                                 instance, splits, d, t, i, j) >
-                            max_load_cutoff + kFixingTolerance) {
+                            segment_pruning_cutoff + kFixingTolerance) {
                             continue;
                         }
 
@@ -198,7 +239,7 @@ namespace {
                                 "_t" + std::to_string(t) +
                                 "_i" + std::to_string(i) +
                                 "_j" + std::to_string(j),
-                                0.0, 0.0, 1.0, VariableType::Integer);
+                                0.0, 0.0, 1.0, VariableType::Binary);
                     }
                 }
             }
@@ -207,11 +248,29 @@ namespace {
         for (int t = 0; t < layout.times; ++t) {
             for (int a = 0; a < layout.arcs; ++a) {
                 if (!arcIsAvailable(instance, t, a)) continue;
+
+                double lambda_lower = 0.0;
+                double lambda_upper =
+                    std::isfinite(free_load_upper_bound)
+                    ? free_load_upper_bound + kFixingTolerance
+                    : kInf;
+
+                // A proved bottleneck is fixed exactly. It is deliberately exempt
+                // from the smaller upper bound imposed on the remaining free loads.
+                if (const auto fixed = fixedLoadValue(fixed_loads, t, a)) {
+                    lambda_lower =
+                        std::max(0.0, *fixed - kLexFixingTolerance);
+                    lambda_upper =
+                        *fixed + kLexFixingTolerance;
+                }
+
                 layout.lambda[layout.loadOffset(t, a)] =
                     model.addColumn(
                         "lambda_a" + std::to_string(arcNameId(instance, a)) +
                         "_t" + std::to_string(t),
-                        0.0, 0.0, kInf);
+                        0.0,
+                        lambda_lower,
+                        lambda_upper);
                 layout.load_position.emplace_back(t, a);
             }
         }
@@ -224,6 +283,8 @@ namespace {
                         const auto current = layout.x[layout.segmentOffset(d, t, i, j)];
                         const auto previous = layout.x[layout.segmentOffset(d, t - 1, i, j)];
                         if (current < 0 && previous < 0) continue;
+
+                        // y represents |x_t - x_{t-1}| for binary x, hence 0 <= y <= 1.
                         layout.y[layout.segmentOffset(d, t, i, j)] =
                             model.addColumn(
                                 "y_d" + std::to_string(d) +
@@ -237,10 +298,12 @@ namespace {
         }
     }
 
+
     void addBaseConstraints(ModelBuilder& model,
         const InstanceData& instance,
         const SplitCoefficients& splits,
-        const Layout& layout) {
+        Layout& layout,
+        const std::vector<FixedLoad>& fixed_loads = {}) {
         // Arc load constraints: capacity * lambda - routed traffic >= 0.
         for (const auto [t, a] : layout.load_position) {
             std::vector<int> index;
@@ -260,10 +323,15 @@ namespace {
                     }
                 }
             }
-            model.addRow(
-                "load_a" + std::to_string(arcNameId(instance, a)) +
-                "_t" + std::to_string(t),
-                0.0, kInf, std::move(index), std::move(value));
+            const bool fixed = loadIsFixed(fixed_loads, t, a);
+            layout.load_row[layout.loadOffset(t, a)] =
+                model.addRow(
+                    "load_a" + std::to_string(arcNameId(instance, a)) +
+                    "_t" + std::to_string(t),
+                    0.0,
+                    fixed ? 0.0 : kInf,
+                    std::move(index),
+                    std::move(value));
         }
 
         // Flow conservation.
@@ -392,12 +460,13 @@ namespace {
         layout.z = model.addColumn("z", 1.0, 0.0, kInf);
 
         for (const auto [t, a] : layout.load_position) {
-            model.addRow(
-                "maxload_a" + std::to_string(arcNameId(instance, a)) +
-                "_t" + std::to_string(t),
-                0.0, kInf,
-                { layout.z, layout.lambda[layout.loadOffset(t, a)] },
-                { 1.0, -1.0 });
+            layout.max_row[layout.loadOffset(t, a)] =
+                model.addRow(
+                    "maxload_a" + std::to_string(arcNameId(instance, a)) +
+                    "_t" + std::to_string(t),
+                    0.0, kInf,
+                    { layout.z, layout.lambda[layout.loadOffset(t, a)] },
+                    { 1.0, -1.0 });
         }
 
         // If the auxiliary common-routing model produced a feasible solution,
@@ -413,6 +482,38 @@ namespace {
                 { 1.0 });
         }
     }
+
+    // When all previous lexicographic levels have been represented by proved
+    // fixed bottlenecks, the next level can be solved much more simply: minimize
+    // the maximum load among the remaining (unfixed) arc/time loads.
+    void addFreeMaxObjective(
+        ModelBuilder& model,
+        const InstanceData& instance,
+        Layout& layout,
+        const std::vector<FixedLoad>& fixed_loads) {
+
+        layout.z = model.addColumn("z_free", 1.0, 0.0, kInf);
+
+        int free_loads = 0;
+        for (const auto [t, a] : layout.load_position) {
+            if (loadIsFixed(fixed_loads, t, a)) continue;
+            ++free_loads;
+
+            model.addRow(
+                "free_maxload_a" + std::to_string(arcNameId(instance, a)) +
+                "_t" + std::to_string(t),
+                0.0,
+                kInf,
+                { layout.z, layout.lambda[layout.loadOffset(t, a)] },
+                { 1.0, -1.0 });
+        }
+
+        if (free_loads == 0) {
+            throw std::runtime_error(
+                "cannot optimize another lexicographic level: all loads are fixed");
+        }
+    }
+
 
     void addKSumObjective(ModelBuilder& model,
         const InstanceData& instance,
@@ -439,20 +540,11 @@ namespace {
             k + 1,
             std::vector<int>(number_of_loads, -1));
 
-        // Preserve the optimal first objective directly:
-        //     lambda_{a,t} <= z_1
-        // No alpha_1 or beta_1 variables are introduced.
-        const double z1 = previous_objectives.at(0);
-        for (const auto [t, a] : layout.load_position) {
-            model.addRow(
-                "preserve_maxload_a" +
-                std::to_string(arcNameId(instance, a)) +
-                "_t" + std::to_string(t),
-                -kInf,
-                z1 + kFixingTolerance,
-                { layout.lambda[layout.loadOffset(t, a)] },
-                { 1.0 });
-        }
+        // The optimal first objective is preserved directly through the upper
+        // bounds of the lambda variables. For k >= 2, addBaseVariables() is
+        // called with max_load_cutoff = z_1, so every lambda_{a,t} has
+        // upper bound z_1 + kFixingTolerance. No separate preserve_maxload
+        // constraints and no alpha_1/beta_1 variables are needed.
 
         // Create auxiliary variables only for lexicographic levels 2..k.
         // Only level k receives objective coefficients.
@@ -501,7 +593,7 @@ namespace {
 
         // Preserve already optimized k-sum values for levels 2..k-1:
         //     i alpha_i + sum beta_i <= z_i.
-        // Level 1 is preserved by lambda <= z_1 above.
+        // Level 1 is preserved by the lambda upper bounds set in addBaseVariables().
         for (int iteration = 2; iteration < k; ++iteration) {
             std::vector<int> index;
             std::vector<double> value;
@@ -564,7 +656,7 @@ namespace {
                             "warm_x_d" + std::to_string(d) +
                             "_i" + std::to_string(i) +
                             "_j" + std::to_string(j),
-                            0.0, 0.0, 1.0, VariableType::Integer);
+                            0.0, 0.0, 1.0, VariableType::Binary);
                 }
             }
         }
@@ -749,8 +841,8 @@ namespace {
         if (options.write_models) {
             std::ostringstream name;
             name << options.model_prefix << "-"
-                 << opt::solverTypeName(options.solver)
-                 << "-common-routing-warm-start.lp";
+                << opt::solverTypeName(options.solver)
+                << "-common-routing-warm-start.lp";
             model_file = name.str();
         }
 
@@ -848,6 +940,94 @@ namespace {
         return loads;
     }
 
+    // Compute the physical loads implied by x. This is used to select the
+    // bottleneck candidate for the fixing test. It avoids accidentally selecting
+    // a nonbinding lambda variable that merely contains slack.
+    std::vector<double> actualLoadValues(
+        const InstanceData& instance,
+        const SplitCoefficients& splits,
+        const Layout& layout,
+        const SolverResult& solution) {
+
+        std::vector<double> loads;
+        loads.reserve(layout.load_position.size());
+
+        for (const auto [t, a] : layout.load_position) {
+            const double capacity = instance.arc_capacities[a];
+            if (capacity <= 0.0) {
+                throw std::runtime_error(
+                    "non-positive capacity while computing actual load");
+            }
+
+            double traffic = 0.0;
+            for (int d = 0; d < layout.demands; ++d) {
+                const double volume = instance.demand_matrix[d][t];
+                if (volume <= 0.0) continue;
+
+                for (int i = 0; i < layout.nodes; ++i) {
+                    for (int j = 0; j < layout.nodes; ++j) {
+                        const int x =
+                            layout.x[layout.segmentOffset(d, t, i, j)];
+                        if (x < 0) continue;
+
+                        const double x_value = solution.values.at(x);
+                        if (std::abs(x_value) <= 1e-12) continue;
+
+                        const double r = splits.value(i, j, a, t);
+                        traffic += r * volume * x_value;
+                    }
+                }
+            }
+
+            loads.push_back(traffic / capacity);
+        }
+
+        return loads;
+    }
+
+    MipStart makeBaseWarmStart(
+        const Layout& layout,
+        const Layout& previous_layout,
+        const SolverResult& previous_solution) {
+
+        MipStart warm;
+        auto addStart = [&](int column, double value) {
+            if (column < 0) return;
+            warm.index.push_back(column);
+            warm.value.push_back(value);
+            };
+
+        for (std::size_t offset = 0; offset < layout.x.size(); ++offset) {
+            const int current_col = layout.x[offset];
+            const int previous_col = previous_layout.x[offset];
+            if (current_col >= 0 && previous_col >= 0 &&
+                previous_col < static_cast<int>(previous_solution.values.size())) {
+                addStart(current_col, previous_solution.values[previous_col]);
+            }
+        }
+
+        for (std::size_t offset = 0; offset < layout.lambda.size(); ++offset) {
+            const int current_col = layout.lambda[offset];
+            const int previous_col = previous_layout.lambda[offset];
+            if (current_col >= 0 && previous_col >= 0 &&
+                previous_col < static_cast<int>(previous_solution.values.size())) {
+                addStart(current_col, previous_solution.values[previous_col]);
+            }
+        }
+
+        for (std::size_t offset = 0; offset < layout.y.size(); ++offset) {
+            const int current_col = layout.y[offset];
+            const int previous_col = previous_layout.y[offset];
+            if (current_col >= 0 && previous_col >= 0 &&
+                previous_col < static_cast<int>(previous_solution.values.size())) {
+                addStart(current_col, previous_solution.values[previous_col]);
+            }
+        }
+
+        return warm;
+    }
+
+
     MipStart makeWarmStart(
         const Layout& layout,
         const Layout& previous_layout,
@@ -860,7 +1040,7 @@ namespace {
             if (column < 0) return;
             warm.index.push_back(column);
             warm.value.push_back(value);
-        };
+            };
 
         // Cutoff preprocessing can change x-column numbering between
         // lexicographic iterations, so values are copied by semantic offset.
@@ -905,13 +1085,338 @@ namespace {
 
                 for (int p = 0; p < static_cast<int>(previous_loads.size()); ++p) {
                     addStart(layout.beta[iteration][p],
-                             std::max(0.0, previous_loads[p] - alpha));
+                        std::max(0.0, previous_loads[p] - alpha));
                 }
             }
         }
 
         return warm;
     }
+
+    struct BottleneckTestResult {
+        bool solved_optimally = false;
+        bool proved_fixed = false;
+        double minimum_candidate_load = kInf;
+    };
+
+    // Test whether one particular current bottleneck is unavoidable.
+    //
+    // Earlier proved bottlenecks are fixed. Every still-free load is bounded by
+    // current_boundary. We then minimize the candidate load itself. If its proven
+    // optimum cannot go below current_boundary, that arc/time load is unavoidable
+    // and can safely be fixed for all subsequent lexicographic levels.
+    BottleneckTestResult testBottleneckCandidate(
+        const InstanceData& instance,
+        const SplitCoefficients& splits,
+        const TasrSolverOptions& options,
+        double remaining_time_seconds,
+        double global_max_cutoff,
+        double current_boundary,
+        const std::vector<FixedLoad>& fixed_loads,
+        int candidate_time,
+        int candidate_arc,
+        const Layout& incumbent_layout,
+        const SolverResult& incumbent_solution,
+        int lexicographic_iteration) {
+
+        BottleneckTestResult result;
+
+        ModelBuilder builder;
+        Layout layout;
+
+        addBaseVariables(
+            builder,
+            instance,
+            splits,
+            layout,
+            global_max_cutoff,
+            current_boundary,
+            fixed_loads);
+        addBaseConstraints(builder, instance, splits, layout, fixed_loads);
+
+        const int candidate_col =
+            layout.lambda[layout.loadOffset(candidate_time, candidate_arc)];
+        if (candidate_col < 0) {
+            throw std::logic_error(
+                "bottleneck-test candidate load does not exist in the model");
+        }
+
+        // ModelBuilder has no objective-coefficient mutator. Introduce a single
+        // objective variable equal to the candidate lambda.
+        const int test_objective =
+            builder.addColumn("bottleneck_test_objective", 1.0, 0.0, kInf);
+
+        builder.addRow(
+            "bottleneck_test_link",
+            0.0,
+            0.0,
+            { test_objective, candidate_col },
+            { 1.0, -1.0 });
+
+        BackendOptions backend_options;
+        backend_options.time_limit_seconds = remaining_time_seconds;
+        backend_options.mip_relative_gap = options.mip_relative_gap;
+        backend_options.solver_output = options.solver_output;
+
+        MipStart warm_start =
+            makeBaseWarmStart(layout, incumbent_layout, incumbent_solution);
+
+        std::string model_file;
+        if (options.write_models) {
+            std::ostringstream name;
+            name << options.model_prefix << "-"
+                << opt::solverTypeName(options.solver)
+                << "-bottleneck-test-" << lexicographic_iteration << ".lp";
+            model_file = name.str();
+        }
+
+        std::cout
+            << "  Testing whether bottleneck (t=" << candidate_time
+            << ", a=" << arcNameId(instance, candidate_arc)
+            << ") is unavoidable at load "
+            << std::setprecision(12) << current_boundary << "...\n";
+
+        const LinearModel model = builder.build();
+        const SolverResult solution = opt::solveModel(
+            options.solver,
+            model,
+            backend_options,
+            &warm_start,
+            model_file);
+
+        if (!solution.feasible) {
+            std::cout
+                << "    bottleneck test returned no feasible solution (status "
+                << solution.status << "); no fixing is performed.\n";
+            return result;
+        }
+
+        result.minimum_candidate_load = solution.objective;
+        result.solved_optimally = solution.optimal;
+
+        if (!solution.optimal) {
+            std::cout
+                << "    bottleneck test stopped with status " << solution.status
+                << " at candidate load " << std::setprecision(12)
+                << solution.objective
+                << "; uniqueness is not proved.\n";
+            return result;
+        }
+
+        result.proved_fixed =
+            solution.objective >= current_boundary - kTolerance;
+
+        if (result.proved_fixed) {
+            std::cout
+                << "    proved unavoidable: minimum candidate load = "
+                << std::setprecision(12) << solution.objective << ".\n";
+        }
+        else {
+            std::cout
+                << "    candidate is not individually unavoidable: it can be reduced to "
+                << std::setprecision(12) << solution.objective
+                << " while all other free loads remain <= "
+                << current_boundary << ".\n";
+        }
+
+        return result;
+    }
+
+
+
+    BottleneckTestResult testBottleneckCandidatePersistent(
+        opt::SolverSession& session,
+        const InstanceData& instance,
+        const TasrSolverOptions& options,
+        double remaining_time_seconds,
+        double current_boundary,
+        const std::vector<FixedLoad>& fixed_loads,
+        int candidate_time,
+        int candidate_arc,
+        const Layout& layout,
+        int lexicographic_iteration) {
+
+        BottleneckTestResult result;
+
+        // Preserve the just-proved lexicographic level by tightening every
+        // still-free load to the current boundary. Already fixed bottlenecks
+        // retain their own narrow [L_i-eps, L_i+eps] bounds.
+        for (const auto [t, a] : layout.load_position) {
+            if (loadIsFixed(fixed_loads, t, a)) continue;
+            const int lambda =
+                layout.lambda[layout.loadOffset(t, a)];
+            session.setColumnBounds(
+                lambda,
+                0.0,
+                current_boundary + kLexFixingTolerance);
+        }
+
+        const int candidate_col =
+            layout.lambda[layout.loadOffset(candidate_time, candidate_arc)];
+        if (candidate_col < 0) {
+            throw std::logic_error(
+                "persistent bottleneck-test candidate does not exist");
+        }
+
+        // Temporarily change the objective from min z_free to min lambda_b.
+        // The same native solver model, presolve information and incumbent state
+        // are retained; no T-ASR rows or columns are reconstructed.
+        session.setObjectiveCoefficient(layout.z, 0.0);
+        session.setObjectiveCoefficient(candidate_col, 1.0);
+
+        BackendOptions backend_options;
+        backend_options.time_limit_seconds = remaining_time_seconds;
+        backend_options.mip_relative_gap = options.mip_relative_gap;
+        backend_options.solver_output = options.solver_output;
+
+        std::string model_file;
+        if (options.write_models) {
+            std::ostringstream name;
+            name << options.model_prefix << "-"
+                << opt::solverTypeName(options.solver)
+                << "-bottleneck-test-" << lexicographic_iteration << ".lp";
+            model_file = name.str();
+        }
+
+        std::cout
+            << "  Re-optimizing persistent model to test bottleneck (t="
+            << candidate_time
+            << ", a=" << arcNameId(instance, candidate_arc)
+            << ") at load "
+            << std::setprecision(12) << current_boundary << "...\n";
+
+        SolverResult solution;
+        try {
+            solution = session.optimize(
+                backend_options,
+                nullptr,
+                model_file);
+        }
+        catch (...) {
+            // Always restore the normal peeled min-max objective.
+            session.setObjectiveCoefficient(candidate_col, 0.0);
+            session.setObjectiveCoefficient(layout.z, 1.0);
+            throw;
+        }
+
+        // Restore the normal objective for the next lexicographic iteration.
+        session.setObjectiveCoefficient(candidate_col, 0.0);
+        session.setObjectiveCoefficient(layout.z, 1.0);
+
+        if (!solution.feasible) {
+            std::cout
+                << "    persistent bottleneck test returned no feasible solution "
+                << "(status " << solution.status
+                << "); no fixing is performed.\n";
+            return result;
+        }
+
+        result.minimum_candidate_load = solution.objective;
+        result.solved_optimally = solution.optimal;
+
+        if (!solution.optimal) {
+            std::cout
+                << "    persistent bottleneck test stopped with status "
+                << solution.status
+                << " at candidate load "
+                << std::setprecision(12) << solution.objective
+                << "; unavoidability is not proved.\n";
+            return result;
+        }
+
+        result.proved_fixed =
+            solution.objective >= current_boundary - kTolerance;
+
+        if (result.proved_fixed) {
+            std::cout
+                << "    proved unavoidable: minimum candidate load = "
+                << std::setprecision(12) << solution.objective << ".\n";
+        }
+        else {
+            std::cout
+                << "    candidate is not individually unavoidable: it can be "
+                << "reduced to " << std::setprecision(12)
+                << solution.objective
+                << " while all other free loads remain <= "
+                << current_boundary << ".\n";
+        }
+
+        return result;
+    }
+
+
+    void prunePersistentSegments(
+        opt::SolverSession& session,
+        const InstanceData& instance,
+        const SplitCoefficients& splits,
+        const Layout& layout,
+        double global_max_cutoff) {
+
+        if (!std::isfinite(global_max_cutoff)) return;
+
+        std::size_t fixed_to_zero = 0;
+        for (int d = 0; d < layout.demands; ++d) {
+            for (int t = 0; t < layout.times; ++t) {
+                for (int i = 0; i < layout.nodes; ++i) {
+                    for (int j = 0; j < layout.nodes; ++j) {
+                        const int col =
+                            layout.x[layout.segmentOffset(d, t, i, j)];
+                        if (col < 0) continue;
+
+                        if (segmentLoadLowerBound(
+                                instance, splits, d, t, i, j) >
+                            global_max_cutoff + kFixingTolerance) {
+                            session.setColumnBounds(col, 0.0, 0.0);
+                            ++fixed_to_zero;
+                        }
+                    }
+                }
+            }
+        }
+
+        if (fixed_to_zero > 0) {
+            std::cout
+                << "  persistent preprocessing fixed "
+                << fixed_to_zero
+                << " additional x variables to zero using z1.\n";
+        }
+    }
+
+
+    void fixPersistentBottleneck(
+        opt::SolverSession& session,
+        const Layout& layout,
+        int time,
+        int arc,
+        double value) {
+
+        const std::size_t offset = layout.loadOffset(time, arc);
+        const int lambda = layout.lambda[offset];
+        const int load_row = layout.load_row[offset];
+        const int max_row = layout.max_row[offset];
+
+        if (lambda < 0 || load_row < 0 || max_row < 0) {
+            throw std::logic_error(
+                "persistent bottleneck references missing model entries");
+        }
+
+        // Keep a small numerical window around the solver-produced load value.
+        session.setColumnBounds(
+            lambda,
+            std::max(0.0, value - kLexFixingTolerance),
+            value + kLexFixingTolerance);
+
+        // A fixed lambda alone could contain slack because the base load row is
+        // capacity*lambda - traffic >= 0. Turn that row into an equality so the
+        // fixed bottleneck remains a physical routed load, not just an artificial
+        // lambda value.
+        session.setRowBounds(load_row, 0.0, 0.0);
+
+        // Remove this already-peeled load from z >= lambda without deleting or
+        // renumbering anything. The row becomes simply z >= 0.
+        session.setCoefficient(max_row, lambda, 0.0);
+    }
+
 
     std::vector<std::vector<std::vector<int>>> extractWaypoints(
         const InstanceData& instance,
@@ -981,7 +1486,7 @@ namespace {
 
         auto offset = [nodes](int d, int i, int j) {
             return ((static_cast<std::size_t>(d) * nodes + i) * nodes + j);
-        };
+            };
 
         for (int d = 0; d < demands; ++d) {
             std::vector<int> successor(nodes, -1);
@@ -1066,59 +1571,76 @@ TasrSolution TasrSolver::solve() {
     const auto process_start = Clock::now();
 
     auto elapsedSeconds = [&]() {
-        return std::chrono::duration<double>(Clock::now() - process_start).count();
+        return std::chrono::duration<double>(
+            Clock::now() - process_start).count();
     };
 
     auto remainingSeconds = [&]() {
-        if (options_.time_limit_seconds <= 0.0) return 0.0; // backend convention: unlimited
-        return std::max(0.0, options_.time_limit_seconds - elapsedSeconds());
+        if (options_.time_limit_seconds <= 0.0) {
+            return 0.0; // backend convention: unlimited
+        }
+        return std::max(
+            0.0,
+            options_.time_limit_seconds - elapsedSeconds());
     };
 
     auto budgetExpired = [&]() {
-        return options_.time_limit_seconds > 0.0 && remainingSeconds() <= 0.0;
+        return options_.time_limit_seconds > 0.0 &&
+            remainingSeconds() <= 0.0;
     };
 
     const int total_loads = [&]() {
         int count = 0;
-        for (int t = 0; t < instance_.num_time_slots; ++t)
-            for (int a = 0; a < instance_.numArcs(); ++a)
+        for (int t = 0; t < instance_.num_time_slots; ++t) {
+            for (int a = 0; a < instance_.numArcs(); ++a) {
                 count += arcIsAvailable(instance_, t, a) ? 1 : 0;
+            }
+        }
         return count;
     }();
+
     if (total_loads == 0) {
-        throw std::runtime_error("instance has no available arc/time loads");
+        throw std::runtime_error(
+            "instance has no available arc/time loads");
     }
 
     int requested_iterations = options_.max_lexicographic_iterations;
-    if (requested_iterations < 0) requested_iterations = total_loads;
-    requested_iterations = std::max(1, std::min(requested_iterations, total_loads));
+    if (requested_iterations < 0) {
+        requested_iterations = total_loads;
+    }
+    requested_iterations = std::max(
+        1,
+        std::min(requested_iterations, total_loads));
 
     std::vector<double> previous_objectives;
+    std::vector<double> lexicographic_load_values;
+
     std::vector<double> previous_loads;
     Layout previous_layout;
     SolverResult previous_solution;
     bool have_previous_solution = false;
     int completed_optimal_iterations = 0;
 
-    // Best feasible full-model solution seen so far. This can be the solution
-    // of the last completed lexicographic iteration or the incumbent returned
-    // by an interrupted / time-limited current iteration.
+    std::vector<FixedLoad> fixed_bottlenecks;
+    bool bottleneck_peeling_active = true;
+
     Layout best_layout;
     SolverResult best_solution;
     std::vector<double> best_loads;
     bool have_best_full_solution = false;
 
-    // The common-routing model is only an acceleration device, but its
-    // solution is itself feasible for the original problem and is retained as
-    // a last-resort fallback if no full lexicographic model returns an incumbent.
     std::optional<CommonRoutingWarmStart> common_routing_start;
     double initial_upper_bound = kInf;
 
+    // The common-routing model is genuinely a different formulation, so it is
+    // still built and solved once as a separate model.
     if (!opt::interruptRequested() && !budgetExpired()) {
         try {
-            const double warm_time = remainingSeconds();
             common_routing_start = solveCommonRoutingWarmStart(
-                instance_, splits_, options_, warm_time);
+                instance_,
+                splits_,
+                options_,
+                remainingSeconds());
             initial_upper_bound = common_routing_start->max_load;
         }
         catch (const std::exception& error) {
@@ -1129,122 +1651,232 @@ TasrSolution TasrSolver::solve() {
         }
     }
 
+    // As long as bottleneck peeling succeeds, this session owns one native
+    // solver model for ALL peeled lexicographic iterations and all bottleneck
+    // tests. No base T-ASR rows/columns are rebuilt in that phase.
+    std::unique_ptr<opt::SolverSession> persistent_session;
+    Layout persistent_layout;
+
     for (int k = 1; k <= requested_iterations; ++k) {
         if (opt::interruptRequested()) {
-            std::cout << "Ctrl+C received; stopping before lexicographic iteration "
-                      << k << ".\n";
+            std::cout
+                << "Ctrl+C received; stopping before lexicographic iteration "
+                << k << ".\n";
             break;
         }
         if (budgetExpired()) {
-            std::cout << "Total time limit reached before lexicographic iteration "
-                      << k << ".\n";
+            std::cout
+                << "Total time limit reached before lexicographic iteration "
+                << k << ".\n";
             break;
         }
 
-        ModelBuilder builder;
-        Layout layout;
+        const bool use_simple_max =
+            (k == 1) ||
+            (bottleneck_peeling_active &&
+             static_cast<int>(fixed_bottlenecks.size()) == k - 1);
 
-        const double max_load_cutoff =
-            (k == 1) ? initial_upper_bound : previous_objectives.at(0);
-
-        addBaseVariables(builder, instance_, splits_, layout, max_load_cutoff);
-        addBaseConstraints(builder, instance_, splits_, layout);
-
-        if (k == 1) {
-            addFirstObjective(builder, instance_, layout, initial_upper_bound);
-        }
-        else {
-            addKSumObjective(builder, instance_, layout, k, previous_objectives);
-        }
-
-        if (opt::interruptRequested() || budgetExpired()) {
-            std::cout << "Stopping after model construction because the total "
-                         "time limit or Ctrl+C was reached.\n";
-            break;
-        }
+        const double global_max_cutoff =
+            (k == 1)
+            ? initial_upper_bound
+            : previous_objectives.at(0);
 
         BackendOptions backend_options;
         backend_options.time_limit_seconds = remainingSeconds();
         backend_options.mip_relative_gap = options_.mip_relative_gap;
         backend_options.solver_output = options_.solver_output;
 
-        MipStart warm_start;
-        const MipStart* warm_start_ptr = nullptr;
-        if (k == 1 && common_routing_start.has_value()) {
-            warm_start = makeCommonRoutingMipStart(layout, common_routing_start->x);
-            warm_start_ptr = &warm_start;
-        }
-        else if (have_previous_solution) {
-            warm_start = makeWarmStart(
-                layout, previous_layout, previous_solution, previous_loads, k);
-            warm_start_ptr = &warm_start;
-        }
+        SolverResult solution;
+        Layout layout;
+        std::size_t displayed_columns = 0;
+        std::size_t displayed_rows = 0;
 
-        std::string model_file;
-        if (options_.write_models) {
-            std::ostringstream name;
-            name << options_.model_prefix << "-"
-                 << opt::solverTypeName(options_.solver)
-                 << "-lex-" << k << ".lp";
-            model_file = name.str();
-        }
+        if (use_simple_max) {
+            if (k == 1) {
+                ModelBuilder builder;
 
-        std::cout << "Lexicographic iteration " << k << '/' << requested_iterations
-                  << " with " << opt::solverTypeName(options_.solver)
-                  << ": " << builder.numColumns() << " columns, "
-                  << builder.numRows() << " rows"
-                  << ", remaining total time = " << std::fixed
-                  << std::setprecision(2)
-                  << (options_.time_limit_seconds > 0.0
-                          ? backend_options.time_limit_seconds
-                          : 0.0)
-                  << (options_.time_limit_seconds > 0.0 ? " s\n" : " (unlimited)\n");
+                addBaseVariables(
+                    builder,
+                    instance_,
+                    splits_,
+                    persistent_layout,
+                    initial_upper_bound,
+                    initial_upper_bound,
+                    {});
+                addBaseConstraints(
+                    builder,
+                    instance_,
+                    splits_,
+                    persistent_layout,
+                    {});
+                addFirstObjective(
+                    builder,
+                    instance_,
+                    persistent_layout,
+                    initial_upper_bound);
 
-        const LinearModel model = builder.build();
-        const SolverResult solution = opt::solveModel(
-            options_.solver, model, backend_options, warm_start_ptr, model_file);
+                const LinearModel model = builder.build();
+                persistent_session =
+                    opt::createSolverSession(options_.solver, model);
 
-        if (solution.feasible) {
-            const std::vector<double> candidate_loads = loadValues(layout, solution);
-
-            if (!have_best_full_solution ||
-                lexicographicallyBetterLoads(candidate_loads, best_loads)) {
-                best_layout = layout;
-                best_solution = solution;
-                best_loads = candidate_loads;
-                have_best_full_solution = true;
-            }
-
-            // Only an optimal solve may define the fixed objective value used
-            // by the next lexicographic iteration. A time-limited/interrupted
-            // incumbent is valid output, but must not seed another lex level.
-            if (solution.optimal) {
-                previous_objectives.push_back(solution.objective);
-                previous_loads = candidate_loads;
-                previous_layout = layout;
-                previous_solution = solution;
-                have_previous_solution = true;
-                completed_optimal_iterations = k;
-
-                std::cout << "  optimal objective (sum of " << k
-                          << " largest loads): " << std::setprecision(12)
-                          << solution.objective << '\n';
+                displayed_columns = persistent_session->numColumns();
+                displayed_rows = persistent_session->numRows();
             }
             else {
-                std::cout << "  solve stopped with status " << solution.status
-                          << "; retaining its best feasible incumbent.\n";
-                break;
+                if (!persistent_session) {
+                    throw std::logic_error(
+                        "bottleneck peeling requires an active persistent solver session");
+                }
+                displayed_columns = persistent_session->numColumns();
+                displayed_rows = persistent_session->numRows();
             }
+
+            layout = persistent_layout;
+
+            MipStart first_start;
+            const MipStart* first_start_ptr = nullptr;
+
+            // Only the first full T-ASR solve needs an explicit MIP start.
+            // Afterwards the same native solver model is re-optimized, so the
+            // previous native solution state is retained by the backend.
+            if (k == 1 && common_routing_start.has_value()) {
+                first_start = makeCommonRoutingMipStart(
+                    layout,
+                    common_routing_start->x);
+                first_start_ptr = &first_start;
+            }
+
+            std::string model_file;
+            if (options_.write_models) {
+                std::ostringstream name;
+                name << options_.model_prefix << "-"
+                    << opt::solverTypeName(options_.solver)
+                    << "-lex-" << k
+                    << (k >= 2 ? "-peeled-persistent" : "-persistent")
+                    << ".lp";
+                model_file = name.str();
+            }
+
+            std::cout
+                << "Lexicographic iteration " << k << '/'
+                << requested_iterations << " with "
+                << opt::solverTypeName(options_.solver)
+                << (k >= 2
+                    ? " [persistent simple max over unfixed loads]"
+                    : " [persistent first max]")
+                << ": " << displayed_columns << " columns, "
+                << displayed_rows << " generic rows"
+                << ", remaining total time = " << std::fixed
+                << std::setprecision(2)
+                << (options_.time_limit_seconds > 0.0
+                    ? backend_options.time_limit_seconds
+                    : 0.0)
+                << (options_.time_limit_seconds > 0.0
+                    ? " s\n"
+                    : " (unlimited)\n");
+
+            solution = persistent_session->optimize(
+                backend_options,
+                first_start_ptr,
+                model_file);
         }
         else {
+            // If peeling failed, fall back to the original exact k-sum model.
+            // This path is rebuilt because its alpha/beta structure grows with k.
+            ModelBuilder builder;
+
+            addBaseVariables(
+                builder,
+                instance_,
+                splits_,
+                layout,
+                global_max_cutoff,
+                global_max_cutoff,
+                fixed_bottlenecks);
+            addBaseConstraints(
+                builder,
+                instance_,
+                splits_,
+                layout,
+                fixed_bottlenecks);
+            addKSumObjective(
+                builder,
+                instance_,
+                layout,
+                k,
+                previous_objectives);
+
+            if (opt::interruptRequested() || budgetExpired()) {
+                std::cout
+                    << "Stopping after model construction because the total "
+                    << "time limit or Ctrl+C was reached.\n";
+                break;
+            }
+
+            MipStart warm_start;
+            const MipStart* warm_start_ptr = nullptr;
+
+            if (have_previous_solution) {
+                warm_start = makeWarmStart(
+                    layout,
+                    previous_layout,
+                    previous_solution,
+                    previous_loads,
+                    k);
+                warm_start_ptr = &warm_start;
+            }
+
+            std::string model_file;
+            if (options_.write_models) {
+                std::ostringstream name;
+                name << options_.model_prefix << "-"
+                    << opt::solverTypeName(options_.solver)
+                    << "-lex-" << k
+                    << "-general-ksum.lp";
+                model_file = name.str();
+            }
+
+            displayed_columns = builder.numColumns();
+            displayed_rows = builder.numRows();
+
+            std::cout
+                << "Lexicographic iteration " << k << '/'
+                << requested_iterations << " with "
+                << opt::solverTypeName(options_.solver)
+                << " [general k-sum fallback]: "
+                << displayed_columns << " columns, "
+                << displayed_rows << " rows"
+                << ", remaining total time = " << std::fixed
+                << std::setprecision(2)
+                << (options_.time_limit_seconds > 0.0
+                    ? backend_options.time_limit_seconds
+                    : 0.0)
+                << (options_.time_limit_seconds > 0.0
+                    ? " s\n"
+                    : " (unlimited)\n");
+
+            const LinearModel model = builder.build();
+            solution = opt::solveModel(
+                options_.solver,
+                model,
+                backend_options,
+                warm_start_ptr,
+                model_file);
+        }
+
+        if (!solution.feasible) {
             const bool graceful_stop =
-                solution.time_limit_reached || solution.interrupted ||
-                opt::interruptRequested() || budgetExpired();
+                solution.time_limit_reached ||
+                solution.interrupted ||
+                opt::interruptRequested() ||
+                budgetExpired();
 
             if (graceful_stop) {
-                std::cout << "  solve stopped with status " << solution.status
-                          << " before finding a new incumbent; retaining the "
-                             "best earlier feasible solution.\n";
+                std::cout
+                    << "  solve stopped with status "
+                    << solution.status
+                    << " before finding a new incumbent; retaining the "
+                    << "best earlier feasible solution.\n";
                 break;
             }
 
@@ -1254,18 +1886,197 @@ TasrSolution TasrSolver::solve() {
                 solution.status);
         }
 
+        const std::vector<double> candidate_loads =
+            loadValues(layout, solution);
+
+        if (!have_best_full_solution ||
+            lexicographicallyBetterLoads(candidate_loads, best_loads)) {
+            best_layout = layout;
+            best_solution = solution;
+            best_loads = candidate_loads;
+            have_best_full_solution = true;
+        }
+
+        if (!solution.optimal) {
+            std::cout
+                << "  solve stopped with status "
+                << solution.status
+                << "; retaining its best feasible incumbent.\n";
+            break;
+        }
+
+        double current_component = 0.0;
+        double cumulative_objective = 0.0;
+
+        if (use_simple_max) {
+            current_component = solution.objective;
+            cumulative_objective =
+                (previous_objectives.empty()
+                    ? 0.0
+                    : previous_objectives.back()) +
+                current_component;
+        }
+        else {
+            cumulative_objective = solution.objective;
+            const double previous_sum =
+                previous_objectives.empty()
+                ? 0.0
+                : previous_objectives.back();
+            current_component =
+                cumulative_objective - previous_sum;
+        }
+
+        previous_objectives.push_back(cumulative_objective);
+        lexicographic_load_values.push_back(current_component);
+        previous_loads = candidate_loads;
+        previous_layout = layout;
+        previous_solution = solution;
+        have_previous_solution = true;
+        completed_optimal_iterations = k;
+
+        std::cout
+            << "  optimal ordered load L_" << k << " = "
+            << std::setprecision(12) << current_component << '\n'
+            << "  cumulative objective (sum of " << k
+            << " largest loads) = "
+            << cumulative_objective << '\n';
+
+        // After z1 is known, exploit the stronger global cutoff without
+        // rebuilding the persistent model: variables that would previously
+        // have been omitted are simply fixed to zero. Column indices stay stable.
+        if (k == 1 && persistent_session) {
+            prunePersistentSegments(
+                *persistent_session,
+                instance_,
+                splits_,
+                persistent_layout,
+                current_component);
+        }
+
+        // -------------------------------------------------------------
+        // Persistent bottleneck unavoidability test
+        // -------------------------------------------------------------
+        if (use_simple_max &&
+            bottleneck_peeling_active &&
+            persistent_session &&
+            !opt::interruptRequested() &&
+            !budgetExpired()) {
+
+            const std::vector<double> actual_loads =
+                actualLoadValues(
+                    instance_,
+                    splits_,
+                    layout,
+                    solution);
+
+            int candidate_position = -1;
+            double candidate_actual_load = -kInf;
+
+            for (int p = 0;
+                 p < static_cast<int>(layout.load_position.size());
+                 ++p) {
+
+                const auto [t, a] = layout.load_position[p];
+                if (loadIsFixed(fixed_bottlenecks, t, a)) {
+                    continue;
+                }
+
+                if (actual_loads[p] > candidate_actual_load) {
+                    candidate_actual_load = actual_loads[p];
+                    candidate_position = p;
+                }
+            }
+
+            if (candidate_position < 0) {
+                std::cout
+                    << "  No unfixed bottleneck candidate remains; "
+                    << "stopping bottleneck peeling.\n";
+                bottleneck_peeling_active = false;
+                persistent_session.reset();
+            }
+            else {
+                const auto [candidate_time, candidate_arc] =
+                    layout.load_position[candidate_position];
+
+                if (candidate_actual_load <
+                    current_component - 10.0 * kTolerance) {
+
+                    std::cout
+                        << "  Warning: largest physical unfixed load ("
+                        << std::setprecision(12)
+                        << candidate_actual_load
+                        << ") is below the optimized boundary ("
+                        << current_component
+                        << "); not attempting a fixing proof.\n";
+
+                    bottleneck_peeling_active = false;
+                    persistent_session.reset();
+                }
+                else {
+                    const BottleneckTestResult test =
+                        testBottleneckCandidatePersistent(
+                            *persistent_session,
+                            instance_,
+                            options_,
+                            remainingSeconds(),
+                            current_component,
+                            fixed_bottlenecks,
+                            candidate_time,
+                            candidate_arc,
+                            persistent_layout,
+                            k);
+
+                    if (test.proved_fixed) {
+                        fixPersistentBottleneck(
+                            *persistent_session,
+                            persistent_layout,
+                            candidate_time,
+                            candidate_arc,
+                            current_component);
+
+                        fixed_bottlenecks.push_back({
+                            candidate_time,
+                            candidate_arc,
+                            current_component });
+
+                        std::cout
+                            << "    FIXED physical load lambda(t="
+                            << candidate_time
+                            << ", a="
+                            << arcNameId(instance_, candidate_arc)
+                            << ") ~= "
+                            << std::setprecision(12)
+                            << current_component
+                            << ". The same native solver model will be "
+                            << "re-optimized for the next level.\n";
+                    }
+                    else {
+                        bottleneck_peeling_active = false;
+                        persistent_session.reset();
+
+                        std::cout
+                            << "    Bottleneck cannot be fixed individually. "
+                            << "Persistent peeling stops; the next iteration "
+                            << "will use the general k-sum formulation.\n";
+                    }
+                }
+            }
+        }
+
         if (opt::interruptRequested() || budgetExpired()) {
-            std::cout << (opt::interruptRequested()
-                              ? "Ctrl+C received; "
-                              : "Total time limit reached; ")
-                      << "returning the best feasible solution found so far.\n";
+            std::cout
+                << (opt::interruptRequested()
+                    ? "Ctrl+C received; "
+                    : "Total time limit reached; ")
+                << "returning the best feasible solution found so far.\n";
             break;
         }
     }
 
     TasrSolution answer;
     answer.lexicographic_objectives = previous_objectives;
-    answer.completed_lexicographic_iterations = completed_optimal_iterations;
+    answer.completed_lexicographic_iterations =
+        completed_optimal_iterations;
 
     if (have_best_full_solution) {
         answer.sorted_loads = best_loads;
@@ -1273,7 +2084,11 @@ TasrSolution TasrSolver::solve() {
             answer.sorted_loads.begin(),
             answer.sorted_loads.end(),
             std::greater<double>());
-        answer.waypoints = extractWaypoints(instance_, best_layout, best_solution);
+        answer.waypoints =
+            extractWaypoints(
+                instance_,
+                best_layout,
+                best_solution);
     }
     else if (common_routing_start.has_value()) {
         answer.sorted_loads = common_routing_start->loads;
@@ -1281,19 +2096,28 @@ TasrSolution TasrSolver::solve() {
             answer.sorted_loads.begin(),
             answer.sorted_loads.end(),
             std::greater<double>());
-        answer.waypoints = extractCommonRoutingWaypoints(
-            instance_, common_routing_start->x);
-        std::cout << "No full lexicographic incumbent was available; writing the "
-                     "feasible common-routing solution.\n";
+        answer.waypoints =
+            extractCommonRoutingWaypoints(
+                instance_,
+                common_routing_start->x);
+
+        std::cout
+            << "No full lexicographic incumbent was available; writing the "
+            << "feasible common-routing solution.\n";
     }
     else {
         throw std::runtime_error(
-            "stopped before any feasible incumbent was available; no solution "
-            "can be written");
+            "stopped before any feasible incumbent was available; "
+            "no solution can be written");
     }
 
-    std::cout << "Total solver-process time: " << std::fixed
-              << std::setprecision(2) << elapsedSeconds() << " seconds\n";
+    std::cout
+        << "Total solver-process time: "
+        << std::fixed
+        << std::setprecision(2)
+        << elapsedSeconds()
+        << " seconds\n";
+
     return answer;
 }
 

@@ -108,7 +108,7 @@ namespace opt {
 
             for (const VariableType type : model.variable_type) {
                 lp.integrality_.push_back(
-                    type == VariableType::Integer
+                    (type == VariableType::Integer || type == VariableType::Binary)
                     ? HighsVarType::kInteger
                     : HighsVarType::kContinuous);
             }
@@ -224,8 +224,200 @@ namespace opt {
                 result.values = highs.getSolution().col_value;
             }
 
+
             return result;
         }
+
+        class HighsSession final : public SolverSession {
+        public:
+            explicit HighsSession(const LinearModel& model)
+                : num_columns_(model.cost.size()),
+                  num_rows_(model.rows.size()) {
+
+                HighsLp lp;
+                lp.num_col_ = static_cast<HighsInt>(model.cost.size());
+                lp.num_row_ = static_cast<HighsInt>(model.rows.size());
+                lp.col_cost_ = model.cost;
+                lp.col_lower_ = model.lower;
+                lp.col_upper_ = model.upper;
+                lp.col_names_ = model.column_names;
+                lp.integrality_.reserve(model.variable_type.size());
+
+                for (const VariableType type : model.variable_type) {
+                    lp.integrality_.push_back(
+                        (type == VariableType::Integer || type == VariableType::Binary)
+                        ? HighsVarType::kInteger
+                        : HighsVarType::kContinuous);
+                }
+
+                lp.row_names_.reserve(model.rows.size());
+                lp.row_lower_.reserve(model.rows.size());
+                lp.row_upper_.reserve(model.rows.size());
+
+                std::vector<std::vector<std::pair<HighsInt, double>>> columns(
+                    model.cost.size());
+
+                for (HighsInt r = 0; r < lp.num_row_; ++r) {
+                    const SparseRow& row =
+                        model.rows.at(static_cast<std::size_t>(r));
+                    lp.row_names_.push_back(row.name);
+                    lp.row_lower_.push_back(row.lower);
+                    lp.row_upper_.push_back(row.upper);
+
+                    for (std::size_t p = 0; p < row.index.size(); ++p) {
+                        columns.at(static_cast<std::size_t>(row.index[p]))
+                            .emplace_back(r, row.value[p]);
+                    }
+                }
+
+                lp.a_matrix_.format_ = MatrixFormat::kColwise;
+                lp.a_matrix_.num_col_ = lp.num_col_;
+                lp.a_matrix_.num_row_ = lp.num_row_;
+                lp.a_matrix_.start_.clear();
+                lp.a_matrix_.index_.clear();
+                lp.a_matrix_.value_.clear();
+
+                std::size_t number_of_nonzeros = 0;
+                for (const auto& column : columns) {
+                    number_of_nonzeros += column.size();
+                }
+
+                lp.a_matrix_.start_.reserve(model.cost.size() + 1);
+                lp.a_matrix_.index_.reserve(number_of_nonzeros);
+                lp.a_matrix_.value_.reserve(number_of_nonzeros);
+                lp.a_matrix_.start_.push_back(0);
+
+                for (const auto& column : columns) {
+                    for (const auto& [row, coefficient] : column) {
+                        lp.a_matrix_.index_.push_back(row);
+                        lp.a_matrix_.value_.push_back(coefficient);
+                    }
+                    lp.a_matrix_.start_.push_back(
+                        static_cast<HighsInt>(lp.a_matrix_.index_.size()));
+                }
+
+                checkHighsStatus(
+                    highs_.setCallback(highsInterruptCallback, nullptr),
+                    "setting interrupt callback");
+                checkHighsStatus(
+                    highs_.startCallback(
+                        static_cast<int>(HighsCallbackType::kCallbackMipInterrupt)),
+                    "starting MIP interrupt callback");
+                checkHighsStatus(
+                    highs_.passModel(std::move(lp)),
+                    "passing persistent model");
+            }
+
+            SolverResult optimize(
+                const BackendOptions& options,
+                const MipStart* mip_start,
+                const std::string& model_file) override {
+
+                checkHighsStatus(
+                    highs_.setOptionValue("output_flag", options.solver_output),
+                    "setting output_flag");
+                checkHighsStatus(
+                    highs_.setOptionValue("mip_rel_gap", options.mip_relative_gap),
+                    "setting mip_rel_gap");
+                checkHighsStatus(
+                    highs_.setOptionValue(
+                        "time_limit",
+                        options.time_limit_seconds > 0.0
+                            ? options.time_limit_seconds
+                            : kHighsInf),
+                    "setting time_limit");
+
+                if (mip_start && !mip_start->empty()) {
+                    validateMipStart(*mip_start, num_columns_);
+                    std::vector<HighsInt> indices;
+                    indices.reserve(mip_start->index.size());
+                    for (const int index : mip_start->index) {
+                        indices.push_back(static_cast<HighsInt>(index));
+                    }
+                    checkHighsStatus(
+                        highs_.setSolution(
+                            static_cast<HighsInt>(indices.size()),
+                            indices.data(),
+                            mip_start->value.data()),
+                        "setting MIP start");
+                }
+
+                if (!model_file.empty()) {
+                    checkHighsStatus(
+                        highs_.writeModel(model_file),
+                        "writing persistent model");
+                }
+
+                checkHighsStatus(highs_.run(), "solving persistent model");
+
+                SolverResult result;
+                result.status =
+                    highs_.modelStatusToString(highs_.getModelStatus());
+                result.optimal =
+                    highs_.getModelStatus() == HighsModelStatus::kOptimal;
+                result.time_limit_reached =
+                    highs_.getModelStatus() == HighsModelStatus::kTimeLimit;
+                result.interrupted =
+                    highs_.getModelStatus() == HighsModelStatus::kInterrupt ||
+                    interruptRequested();
+                result.feasible =
+                    highsHasUsableSolution(highs_) &&
+                    highs_.getSolution().value_valid;
+
+                if (result.feasible) {
+                    result.objective = highs_.getObjectiveValue();
+                    result.values = highs_.getSolution().col_value;
+                }
+                return result;
+            }
+
+            void setColumnBounds(
+                int column, double lower, double upper) override {
+                checkHighsStatus(
+                    highs_.changeColBounds(
+                        static_cast<HighsInt>(column), lower, upper),
+                    "changing persistent column bounds");
+            }
+
+            void setObjectiveCoefficient(
+                int column, double value) override {
+                checkHighsStatus(
+                    highs_.changeColCost(
+                        static_cast<HighsInt>(column), value),
+                    "changing persistent objective coefficient");
+            }
+
+            void setRowBounds(
+                int row, double lower, double upper) override {
+                checkHighsStatus(
+                    highs_.changeRowBounds(
+                        static_cast<HighsInt>(row), lower, upper),
+                    "changing persistent row bounds");
+            }
+
+            void setCoefficient(
+                int row, int column, double value) override {
+                checkHighsStatus(
+                    highs_.changeCoeff(
+                        static_cast<HighsInt>(row),
+                        static_cast<HighsInt>(column),
+                        value),
+                    "changing persistent matrix coefficient");
+            }
+
+            std::size_t numColumns() const noexcept override {
+                return num_columns_;
+            }
+
+            std::size_t numRows() const noexcept override {
+                return num_rows_;
+            }
+
+        private:
+            Highs highs_;
+            std::size_t num_columns_ = 0;
+            std::size_t num_rows_ = 0;
+        };
 #endif
 
 #ifdef ROADEF_HAVE_GUROBI
@@ -412,7 +604,7 @@ namespace opt {
                     "OutputFlag",
                     options.solver_output ? 1 : 0),
                 "setting OutputFlag");
-
+            
             checkGurobi(
                 env,
                 GRBsetdblparam(
@@ -420,6 +612,33 @@ namespace opt {
                     "MIPGap",
                     options.mip_relative_gap),
                 "setting MIPGap");
+
+			// Gurobi's MIPFocus=3 setting is recommended for lexicographic optimization.
+            checkGurobi(
+                env,
+                GRBsetintparam(
+                    env,
+                    "MIPFocus",
+                    3),
+                "setting MIPFocus");
+            
+			// Gurobi's Heuristics=0.01 setting is recommended for lexicographic optimization.
+            checkGurobi(
+                env,
+                GRBsetdblparam(
+                    env,
+                    "Heuristics",
+                    0.01),
+                "setting Heuristics");
+            
+            checkGurobi(
+                env,
+                GRBsetintparam(
+                    env,
+                    "Cuts",
+                    2),
+                "setting Cuts");
+            
 
             if (options.time_limit_seconds > 0.0) {
                 checkGurobi(
@@ -441,10 +660,19 @@ namespace opt {
             for (int c = 0; c < num_vars; ++c) {
                 lb[c] = gurobiBound(model.lower[static_cast<std::size_t>(c)]);
                 ub[c] = gurobiBound(model.upper[static_cast<std::size_t>(c)]);
-                vtype[c] = model.variable_type[static_cast<std::size_t>(c)] ==
-                    VariableType::Integer
-                    ? GRB_INTEGER
-                    : GRB_CONTINUOUS;
+                switch (model.variable_type[static_cast<std::size_t>(c)]) {
+                case VariableType::Continuous:
+                    vtype[c] = GRB_CONTINUOUS;
+                    break;
+
+                case VariableType::Integer:
+                    vtype[c] = GRB_INTEGER;
+                    break;
+
+                case VariableType::Binary:
+                    vtype[c] = GRB_BINARY;
+                    break;
+                }
                 names[c] = const_cast<char*>(
                     model.column_names[static_cast<std::size_t>(c)].c_str());
             }
@@ -547,8 +775,413 @@ namespace opt {
                 }
             }
 
+
             return result;
         }
+
+        class GurobiSession final : public SolverSession {
+        public:
+            explicit GurobiSession(const LinearModel& model)
+                : env_(sharedGurobiEnvironment()),
+                  num_columns_(model.cost.size()),
+                  num_rows_(model.rows.size()),
+                  native_rows_(model.rows.size()) {
+
+                const int num_vars = static_cast<int>(model.cost.size());
+
+                std::vector<double> lb(num_vars);
+                std::vector<double> ub(num_vars);
+                std::vector<char> vtype(num_vars);
+                std::vector<char*> names(num_vars);
+
+                for (int c = 0; c < num_vars; ++c) {
+                    lb[c] = gurobiBound(model.lower[static_cast<std::size_t>(c)]);
+                    ub[c] = gurobiBound(model.upper[static_cast<std::size_t>(c)]);
+
+                    switch (model.variable_type[static_cast<std::size_t>(c)]) {
+                    case VariableType::Continuous:
+                        vtype[c] = GRB_CONTINUOUS;
+                        break;
+                    case VariableType::Integer:
+                        vtype[c] = GRB_INTEGER;
+                        break;
+                    case VariableType::Binary:
+                        vtype[c] = GRB_BINARY;
+                        break;
+                    }
+
+                    names[c] = const_cast<char*>(
+                        model.column_names[static_cast<std::size_t>(c)].c_str());
+                }
+
+                GRBmodel* raw_model = nullptr;
+                checkGurobi(
+                    env_,
+                    GRBnewmodel(
+                        env_,
+                        &raw_model,
+                        "tasr-persistent",
+                        num_vars,
+                        num_vars == 0
+                            ? nullptr
+                            : const_cast<double*>(model.cost.data()),
+                        num_vars == 0 ? nullptr : lb.data(),
+                        num_vars == 0 ? nullptr : ub.data(),
+                        num_vars == 0 ? nullptr : vtype.data(),
+                        num_vars == 0 ? nullptr : names.data()),
+                    "creating persistent Gurobi model");
+                model_.reset(raw_model);
+
+                int next_native_row = 0;
+                for (std::size_t r = 0; r < model.rows.size(); ++r) {
+                    const SparseRow& row = model.rows[r];
+                    std::vector<int> indices = row.index;
+                    std::vector<double> values = row.value;
+
+                    const bool finite_lower = std::isfinite(row.lower);
+                    const bool finite_upper = std::isfinite(row.upper);
+
+                    auto add_one = [&](char sense,
+                                       double rhs,
+                                       const std::string& name) {
+                        checkGurobi(
+                            env_,
+                            GRBaddconstr(
+                                model_.get(),
+                                static_cast<int>(indices.size()),
+                                indices.empty() ? nullptr : indices.data(),
+                                values.empty() ? nullptr : values.data(),
+                                sense,
+                                rhs,
+                                name.c_str()),
+                            "adding persistent constraint '" + name + "'");
+                        native_rows_[r].push_back(next_native_row++);
+                    };
+
+                    if (!finite_lower && !finite_upper) {
+                        continue;
+                    }
+
+                    if (finite_lower && finite_upper &&
+                        std::abs(row.lower - row.upper) <= 1e-12) {
+                        add_one(GRB_EQUAL, row.lower, row.name);
+                    }
+                    else {
+                        if (finite_lower) {
+                            add_one(
+                                GRB_GREATER_EQUAL,
+                                row.lower,
+                                row.name + "_lb");
+                        }
+                        if (finite_upper) {
+                            add_one(
+                                GRB_LESS_EQUAL,
+                                row.upper,
+                                row.name + "_ub");
+                        }
+                    }
+                }
+
+                checkGurobi(
+                    env_,
+                    GRBupdatemodel(model_.get()),
+                    "updating persistent Gurobi model");
+
+                checkGurobi(
+                    env_,
+                    GRBsetcallbackfunc(
+                        model_.get(), gurobiInterruptCallback, nullptr),
+                    "setting persistent interrupt callback");
+            }
+
+            SolverResult optimize(
+                const BackendOptions& options,
+                const MipStart* mip_start,
+                const std::string& model_file) override {
+
+                checkGurobi(
+                    env_,
+                    GRBsetintparam(
+                        env_,
+                        "OutputFlag",
+                        options.solver_output ? 1 : 0),
+                    "setting OutputFlag");
+
+                checkGurobi(
+                    env_,
+                    GRBsetdblparam(
+                        env_,
+                        "MIPGap",
+                        options.mip_relative_gap),
+                    "setting MIPGap");
+
+                checkGurobi(
+                    env_,
+                    GRBsetintparam(env_, "MIPFocus", 3),
+                    "setting MIPFocus");
+
+                checkGurobi(
+                    env_,
+                    GRBsetdblparam(env_, "Heuristics", 0.01),
+                    "setting Heuristics");
+
+                checkGurobi(
+                    env_,
+                    GRBsetintparam(env_, "Cuts", 2),
+                    "setting Cuts");
+
+                checkGurobi(
+                    env_,
+                    GRBsetdblparam(
+                        env_,
+                        "TimeLimit",
+                        options.time_limit_seconds > 0.0
+                            ? options.time_limit_seconds
+                            : GRB_INFINITY),
+                    "setting TimeLimit");
+
+                if (mip_start && !mip_start->empty()) {
+                    validateMipStart(*mip_start, num_columns_);
+                    for (std::size_t p = 0;
+                         p < mip_start->index.size();
+                         ++p) {
+                        checkGurobi(
+                            env_,
+                            GRBsetdblattrelement(
+                                model_.get(),
+                                "Start",
+                                mip_start->index[p],
+                                mip_start->value[p]),
+                            "setting persistent Gurobi MIP-start value");
+                    }
+                }
+
+                checkGurobi(
+                    env_,
+                    GRBupdatemodel(model_.get()),
+                    "updating persistent Gurobi model before solve");
+
+                if (!model_file.empty()) {
+                    checkGurobi(
+                        env_,
+                        GRBwrite(model_.get(), model_file.c_str()),
+                        "writing persistent model to '" + model_file + "'");
+                }
+
+                checkGurobi(
+                    env_,
+                    GRBoptimize(model_.get()),
+                    "optimizing persistent Gurobi model");
+
+                SolverResult result;
+
+                int status = 0;
+                checkGurobi(
+                    env_,
+                    GRBgetintattr(model_.get(), "Status", &status),
+                    "reading persistent model status");
+
+                int solution_count = 0;
+                checkGurobi(
+                    env_,
+                    GRBgetintattr(model_.get(), "SolCount", &solution_count),
+                    "reading persistent solution count");
+
+                result.status = gurobiStatusString(status);
+                result.optimal = status == GRB_OPTIMAL;
+                result.time_limit_reached = status == GRB_TIME_LIMIT;
+                result.interrupted =
+                    status == GRB_INTERRUPTED || interruptRequested();
+                result.feasible = solution_count > 0;
+
+                if (result.feasible) {
+                    checkGurobi(
+                        env_,
+                        GRBgetdblattr(
+                            model_.get(), "ObjVal", &result.objective),
+                        "reading persistent objective value");
+
+                    result.values.resize(num_columns_);
+                    if (!result.values.empty()) {
+                        checkGurobi(
+                            env_,
+                            GRBgetdblattrarray(
+                                model_.get(),
+                                "X",
+                                0,
+                                static_cast<int>(result.values.size()),
+                                result.values.data()),
+                            "reading persistent variable values");
+                    }
+                }
+
+                return result;
+            }
+
+            void setColumnBounds(
+                int column, double lower, double upper) override {
+                checkColumn(column);
+                checkGurobi(
+                    env_,
+                    GRBsetdblattrelement(
+                        model_.get(), "LB", column, gurobiBound(lower)),
+                    "changing persistent Gurobi lower bound");
+                checkGurobi(
+                    env_,
+                    GRBsetdblattrelement(
+                        model_.get(), "UB", column, gurobiBound(upper)),
+                    "changing persistent Gurobi upper bound");
+            }
+
+            void setObjectiveCoefficient(
+                int column, double value) override {
+                checkColumn(column);
+                checkGurobi(
+                    env_,
+                    GRBsetdblattrelement(
+                        model_.get(), "Obj", column, value),
+                    "changing persistent Gurobi objective");
+            }
+
+            void setRowBounds(
+                int row, double lower, double upper) override {
+                checkRow(row);
+                const auto& native = native_rows_[static_cast<std::size_t>(row)];
+
+                if (native.empty()) {
+                    throw std::logic_error(
+                        "cannot activate a row that had no finite bounds");
+                }
+
+                const bool finite_lower = std::isfinite(lower);
+                const bool finite_upper = std::isfinite(upper);
+                const bool equality =
+                    finite_lower && finite_upper &&
+                    std::abs(lower - upper) <= 1e-12;
+
+                if (native.size() == 1) {
+                    char sense = 0;
+                    double rhs = 0.0;
+
+                    if (equality) {
+                        sense = GRB_EQUAL;
+                        rhs = lower;
+                    }
+                    else if (finite_lower && !finite_upper) {
+                        sense = GRB_GREATER_EQUAL;
+                        rhs = lower;
+                    }
+                    else if (!finite_lower && finite_upper) {
+                        sense = GRB_LESS_EQUAL;
+                        rhs = upper;
+                    }
+                    else {
+                        throw std::logic_error(
+                            "unsupported persistent Gurobi row-bound change");
+                    }
+
+                    checkGurobi(
+                        env_,
+                        GRBsetcharattrelement(
+                            model_.get(), "Sense", native[0], sense),
+                        "changing persistent Gurobi row sense");
+                    checkGurobi(
+                        env_,
+                        GRBsetdblattrelement(
+                            model_.get(), "RHS", native[0], rhs),
+                        "changing persistent Gurobi row RHS");
+                    return;
+                }
+
+                if (native.size() == 2 &&
+                    finite_lower && finite_upper && !equality) {
+                    checkGurobi(
+                        env_,
+                        GRBsetcharattrelement(
+                            model_.get(),
+                            "Sense",
+                            native[0],
+                            GRB_GREATER_EQUAL),
+                        "changing persistent lower-row sense");
+                    checkGurobi(
+                        env_,
+                        GRBsetdblattrelement(
+                            model_.get(), "RHS", native[0], lower),
+                        "changing persistent lower-row RHS");
+                    checkGurobi(
+                        env_,
+                        GRBsetcharattrelement(
+                            model_.get(),
+                            "Sense",
+                            native[1],
+                            GRB_LESS_EQUAL),
+                        "changing persistent upper-row sense");
+                    checkGurobi(
+                        env_,
+                        GRBsetdblattrelement(
+                            model_.get(), "RHS", native[1], upper),
+                        "changing persistent upper-row RHS");
+                    return;
+                }
+
+                throw std::logic_error(
+                    "unsupported persistent Gurobi row-bound change");
+            }
+
+            void setCoefficient(
+                int row, int column, double value) override {
+                checkRow(row);
+                checkColumn(column);
+
+                const auto& native =
+                    native_rows_[static_cast<std::size_t>(row)];
+                for (const int native_row : native) {
+                    int constr = native_row;
+                    int var = column;
+                    double coefficient = value;
+                    checkGurobi(
+                        env_,
+                        GRBchgcoeffs(
+                            model_.get(),
+                            1,
+                            &constr,
+                            &var,
+                            &coefficient),
+                        "changing persistent Gurobi matrix coefficient");
+                }
+            }
+
+            std::size_t numColumns() const noexcept override {
+                return num_columns_;
+            }
+
+            std::size_t numRows() const noexcept override {
+                return num_rows_;
+            }
+
+        private:
+            void checkColumn(int column) const {
+                if (column < 0 ||
+                    static_cast<std::size_t>(column) >= num_columns_) {
+                    throw std::out_of_range(
+                        "persistent solver column index out of range");
+                }
+            }
+
+            void checkRow(int row) const {
+                if (row < 0 ||
+                    static_cast<std::size_t>(row) >= num_rows_) {
+                    throw std::out_of_range(
+                        "persistent solver row index out of range");
+                }
+            }
+
+            GRBenv* env_ = nullptr;
+            GurobiModelPtr model_;
+            std::size_t num_columns_ = 0;
+            std::size_t num_rows_ = 0;
+            std::vector<std::vector<int>> native_rows_;
+        };
 #endif
 
     } // namespace
@@ -567,7 +1200,7 @@ namespace opt {
         return column;
     }
 
-    void ModelBuilder::addRow(std::string name,
+    int ModelBuilder::addRow(std::string name,
         double lower,
         double upper,
         std::vector<int> index,
@@ -575,12 +1208,14 @@ namespace opt {
         if (index.size() != value.size()) {
             throw std::logic_error("row index/value size mismatch");
         }
+        const int row = static_cast<int>(model_.rows.size());
         model_.rows.push_back({
             std::move(name),
             lower,
             upper,
             std::move(index),
             std::move(value) });
+        return row;
     }
 
     LinearModel ModelBuilder::build() const {
@@ -643,20 +1278,17 @@ namespace opt {
         return false;
     }
 
-    SolverResult solveModel(SolverType type,
-        const LinearModel& model,
-        const BackendOptions& options,
-        const MipStart* mip_start,
-        const std::string& model_file) {
+
+    std::unique_ptr<SolverSession> createSolverSession(
+        SolverType type,
+        const LinearModel& model) {
+
         validateModel(model);
-        if (mip_start) {
-            validateMipStart(*mip_start, model.cost.size());
-        }
 
         switch (type) {
         case SolverType::Highs:
 #ifdef ROADEF_HAVE_HIGHS
-            return solveHighs(model, options, mip_start, model_file);
+            return std::make_unique<HighsSession>(model);
 #else
             throw std::runtime_error(
                 "HiGHS support was not compiled into this executable");
@@ -664,7 +1296,7 @@ namespace opt {
 
         case SolverType::Gurobi:
 #ifdef ROADEF_HAVE_GUROBI
-            return solveGurobi(model, options, mip_start, model_file);
+            return std::make_unique<GurobiSession>(model);
 #else
             throw std::runtime_error(
                 "Gurobi support was not compiled into this executable");
@@ -672,6 +1304,16 @@ namespace opt {
         }
 
         throw std::logic_error("invalid solver type");
+    }
+
+    SolverResult solveModel(SolverType type,
+        const LinearModel& model,
+        const BackendOptions& options,
+        const MipStart* mip_start,
+        const std::string& model_file) {
+
+        auto session = createSolverSession(type, model);
+        return session->optimize(options, mip_start, model_file);
     }
 
 } // namespace opt
