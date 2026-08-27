@@ -66,6 +66,14 @@ struct BackendOptions {
     double time_limit_seconds = 0.0;
     double mip_relative_gap = 0.0;
     bool solver_output = true;
+
+    // Optional early-stop criterion for minimization MIPs:
+    // terminate as soon as a feasible incumbent with objective strictly below
+    // incumbent_stop_value is found.  This is used by the bottleneck helper,
+    // where one such incumbent is already a certificate that the candidate
+    // bottleneck is not unavoidable.
+    bool stop_when_incumbent_below = false;
+    double incumbent_stop_value = -kInfinity;
 };
 
 // Partial MIP start: only listed columns are supplied to the solver.
@@ -81,6 +89,11 @@ struct SolverResult {
     bool optimal = false;
     bool time_limit_reached = false;
     bool interrupted = false;
+
+    // True only when the backend deliberately terminated because the requested
+    // incumbent threshold was reached.  This is distinct from Ctrl+C/time limit.
+    bool incumbent_stop_triggered = false;
+
     double objective = kInfinity;
     std::vector<double> values;
     std::string status;

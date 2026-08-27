@@ -22,7 +22,22 @@
 namespace {
     constexpr double kTolerance = 1e-7;
     constexpr double kFixingTolerance = 1e-9;
-    constexpr double kLexFixingTolerance = 1e-7;
+
+    // Use one consistent tolerance for all constraints/bounds that preserve
+    // already-proved lexicographic levels. This is intentionally larger than
+    // kFixingTolerance because these values originate from solver-produced
+    // floating-point optima and must remain consistent with MIP feasibility
+    // tolerances across repeated solves.
+    constexpr double kLexTolerance = 1e-6;
+    constexpr double kLexFixingTolerance = kLexTolerance;
+
+    // Diagnostics are deliberately separated from the mathematical tolerances.
+    // A warning means "worth inspecting"; an error means that the persistent
+    // model and the physical loads implied by x disagree too much to trust
+    // further bottleneck fixings.
+    constexpr double kInvariantWarningTolerance = 1e-7;
+    constexpr double kInvariantErrorTolerance = 1e-5;
+    constexpr double kBottleneckProofTolerance = 1e-8;
     constexpr double kInf = std::numeric_limits<double>::infinity();
 
     using opt::BackendOptions;
@@ -229,7 +244,7 @@ namespace {
                         if (std::isfinite(segment_pruning_cutoff) &&
                             segmentLoadLowerBound(
                                 instance, splits, d, t, i, j) >
-                            segment_pruning_cutoff + kFixingTolerance) {
+                            segment_pruning_cutoff + kLexFixingTolerance) {
                             continue;
                         }
 
@@ -252,11 +267,12 @@ namespace {
                 double lambda_lower = 0.0;
                 double lambda_upper =
                     std::isfinite(free_load_upper_bound)
-                    ? free_load_upper_bound + kFixingTolerance
+                    ? free_load_upper_bound + kLexTolerance
                     : kInf;
 
-                // A proved bottleneck is fixed exactly. It is deliberately exempt
-                // from the smaller upper bound imposed on the remaining free loads.
+                // A proved bottleneck is fixed within the common numerical
+                // lexicographic window. It is deliberately exempt from the smaller
+                // upper bound imposed on the remaining free loads.
                 if (const auto fixed = fixedLoadValue(fixed_loads, t, a)) {
                     lambda_lower =
                         std::max(0.0, *fixed - kLexFixingTolerance);
@@ -303,8 +319,15 @@ namespace {
         const InstanceData& instance,
         const SplitCoefficients& splits,
         Layout& layout,
-        const std::vector<FixedLoad>& fixed_loads = {}) {
-        // Arc load constraints: capacity * lambda - routed traffic >= 0.
+        const std::vector<FixedLoad> & /*fixed_loads*/ = {}) {
+        // Arc-load definition:
+        //
+        //     capacity[a] * lambda[a,t] - routed_traffic[a,t] = 0.
+        //
+        // lambda is the actual physical utilization, not merely an upper bound.
+        // Keeping this as an equality for every arc prevents unused/free lambda
+        // variables from carrying artificial slack and corrupting later peeled
+        // lexicographic max objectives.
         for (const auto [t, a] : layout.load_position) {
             std::vector<int> index;
             std::vector<double> value;
@@ -323,13 +346,12 @@ namespace {
                     }
                 }
             }
-            const bool fixed = loadIsFixed(fixed_loads, t, a);
             layout.load_row[layout.loadOffset(t, a)] =
                 model.addRow(
                     "load_a" + std::to_string(arcNameId(instance, a)) +
                     "_t" + std::to_string(t),
                     0.0,
-                    fixed ? 0.0 : kInf,
+                    0.0,
                     std::move(index),
                     std::move(value));
         }
@@ -515,56 +537,82 @@ namespace {
     }
 
 
-    void addKSumObjective(ModelBuilder& model,
+    // After bottleneck peeling stops, solve the lexicographic problem only on
+    // the still-unfixed residual load vector.
+    //
+    // Suppose m loads L_1,...,L_m were proved individually unavoidable and
+    // fixed. The first residual level R_1 = L_{m+1} was already optimized by
+    // the last simple-max solve. Therefore R_1 is preserved directly by the
+    // upper bounds lambda <= R_1 + tolerance on every unfixed load.
+    //
+    // For global iteration k > m+1, define residual_k = k-m. We then need only
+    // the residual ordered-sum formulation of order residual_k, not the global
+    // order-k formulation. Fixed loads are not included in alpha/beta at all.
+    void addResidualKSumObjective(
+        ModelBuilder& model,
         const InstanceData& instance,
         Layout& layout,
-        int k,
-        const std::vector<double>& previous_objectives) {
+        int residual_k,
+        const std::vector<double>& previous_residual_objectives,
+        const std::vector<FixedLoad>& fixed_loads) {
 
-        if (k < 2) {
-            throw std::logic_error("addKSumObjective requires k >= 2");
-        }
-        if (previous_objectives.size() <
-            static_cast<std::size_t>(k - 1)) {
+        if (residual_k < 2) {
             throw std::logic_error(
-                "missing previous lexicographic objective values");
+                "addResidualKSumObjective requires residual_k >= 2");
+        }
+        if (previous_residual_objectives.size() <
+            static_cast<std::size_t>(residual_k - 1)) {
+            throw std::logic_error(
+                "missing previous residual lexicographic objective values");
         }
 
         const int number_of_loads =
             static_cast<int>(layout.load_position.size());
 
-        // Index directly by lexicographic iteration. Entries 0 and 1 are
-        // intentionally unused because iteration 1 has no alpha/beta model.
-        layout.alpha.assign(k + 1, -1);
+        std::vector<int> free_positions;
+        free_positions.reserve(number_of_loads);
+        for (int p = 0; p < number_of_loads; ++p) {
+            const auto [t, a] = layout.load_position[p];
+            if (!loadIsFixed(fixed_loads, t, a)) {
+                free_positions.push_back(p);
+            }
+        }
+
+        if (static_cast<int>(free_positions.size()) < residual_k) {
+            throw std::logic_error(
+                "residual k-sum model has fewer unfixed loads than residual_k");
+        }
+
+        // Indexed by residual lexicographic level. Entries 0 and 1 are unused:
+        // residual level 1 is preserved directly by lambda upper bounds.
+        layout.alpha.assign(residual_k + 1, -1);
         layout.beta.assign(
-            k + 1,
+            residual_k + 1,
             std::vector<int>(number_of_loads, -1));
 
-        // The optimal first objective is preserved directly through the upper
-        // bounds of the lambda variables. For k >= 2, addBaseVariables() is
-        // called with max_load_cutoff = z_1, so every lambda_{a,t} has
-        // upper bound z_1 + kFixingTolerance. No separate preserve_maxload
-        // constraints and no alpha_1/beta_1 variables are needed.
-
-        // Create auxiliary variables only for lexicographic levels 2..k.
-        // Only level k receives objective coefficients.
-        for (int iteration = 2; iteration <= k; ++iteration) {
+        // Create alpha/beta only for residual levels 2..residual_k.
+        // Only the current residual level receives objective coefficients.
+        for (int iteration = 2; iteration <= residual_k; ++iteration) {
             const double alpha_cost =
-                (iteration == k) ? static_cast<double>(k) : 0.0;
+                (iteration == residual_k)
+                ? static_cast<double>(residual_k)
+                : 0.0;
 
+            // alpha remains unrestricted, as in the canonical ordered-sum
+            // formulation.
             layout.alpha[iteration] = model.addColumn(
-                "alpha_k" + std::to_string(iteration),
+                "alpha_r" + std::to_string(iteration),
                 alpha_cost,
                 -kInf,
                 kInf);
 
-            for (int p = 0; p < number_of_loads; ++p) {
+            for (const int p : free_positions) {
                 const double beta_cost =
-                    (iteration == k) ? 1.0 : 0.0;
+                    (iteration == residual_k) ? 1.0 : 0.0;
                 const auto [t, a] = layout.load_position[p];
 
                 layout.beta[iteration][p] = model.addColumn(
-                    "beta_k" + std::to_string(iteration) +
+                    "beta_r" + std::to_string(iteration) +
                     "_a" + std::to_string(arcNameId(instance, a)) +
                     "_t" + std::to_string(t),
                     beta_cost,
@@ -573,13 +621,13 @@ namespace {
             }
         }
 
-        // beta^i_{a,t} >= lambda_{a,t} - alpha_i, i = 2..k.
-        for (int iteration = 2; iteration <= k; ++iteration) {
-            for (int p = 0; p < number_of_loads; ++p) {
+        // beta^i_{a,t} >= lambda_{a,t} - alpha_i for UNFIXED loads only.
+        for (int iteration = 2; iteration <= residual_k; ++iteration) {
+            for (const int p : free_positions) {
                 const auto [t, a] = layout.load_position[p];
 
                 model.addRow(
-                    "beta_excess_k" + std::to_string(iteration) +
+                    "beta_excess_r" + std::to_string(iteration) +
                     "_a" + std::to_string(arcNameId(instance, a)) +
                     "_t" + std::to_string(t),
                     0.0,
@@ -591,10 +639,14 @@ namespace {
             }
         }
 
-        // Preserve already optimized k-sum values for levels 2..k-1:
-        //     i alpha_i + sum beta_i <= z_i.
-        // Level 1 is preserved by the lambda upper bounds set in addBaseVariables().
-        for (int iteration = 2; iteration < k; ++iteration) {
+        // Preserve already optimized residual ordered sums for levels
+        // 2..residual_k-1:
+        //
+        //     i * alpha_i + sum_{free p} beta^i_p <= R_i + tolerance.
+        //
+        // R_1 needs no alpha/beta representation because all unfixed lambdas
+        // already have upper bound R_1 + tolerance in addBaseVariables().
+        for (int iteration = 2; iteration < residual_k; ++iteration) {
             std::vector<int> index;
             std::vector<double> value;
 
@@ -604,17 +656,21 @@ namespace {
                 layout.alpha[iteration],
                 static_cast<double>(iteration));
 
-            for (const int beta : layout.beta[iteration]) {
-                appendTerm(index, value, beta, 1.0);
+            for (const int p : free_positions) {
+                appendTerm(
+                    index,
+                    value,
+                    layout.beta[iteration][p],
+                    1.0);
             }
 
             const double rhs =
-                previous_objectives.at(
+                previous_residual_objectives.at(
                     static_cast<std::size_t>(iteration - 1)) +
-                kFixingTolerance;
+                kLexTolerance;
 
             model.addRow(
-                "preserve_ksum_k" + std::to_string(iteration),
+                "preserve_residual_ksum_r" + std::to_string(iteration),
                 -kInf,
                 rhs,
                 std::move(index),
@@ -681,7 +737,10 @@ namespace {
             }
         }
 
-        // Same load equations as in the full model, but with common x[d,i,j].
+        // Same physical load equations as in the full model, but with common
+        // x[d,i,j]:
+        //
+        //     capacity[a] * lambda[a,t] - routed_traffic[a,t] = 0.
         for (const auto [t, a] : layout.load_position) {
             std::vector<int> index;
             std::vector<double> value;
@@ -711,7 +770,7 @@ namespace {
                 "warm_load_a" +
                 std::to_string(arcNameId(instance, a)) +
                 "_t" + std::to_string(t),
-                0.0, kInf,
+                0.0, 0.0,
                 std::move(index), std::move(value));
         }
 
@@ -985,6 +1044,297 @@ namespace {
         return loads;
     }
 
+    void reportInvariantDifference(
+        const std::string& label,
+        double lhs,
+        double rhs,
+        double warning_tolerance = kInvariantWarningTolerance,
+        double error_tolerance = kInvariantErrorTolerance) {
+
+        const double difference = std::abs(lhs - rhs);
+        if (difference > error_tolerance) {
+            std::ostringstream message;
+            message << std::setprecision(16)
+                << "MODEL INVARIANT ERROR: " << label
+                << ": lhs=" << lhs
+                << ", rhs=" << rhs
+                << ", |diff|=" << difference
+                << " > " << error_tolerance;
+            throw std::runtime_error(message.str());
+        }
+
+        if (difference > warning_tolerance) {
+            std::cerr << std::setprecision(16)
+                << "WARNING: " << label
+                << ": lhs=" << lhs
+                << ", rhs=" << rhs
+                << ", |diff|=" << difference
+                << " > " << warning_tolerance << '\n';
+        }
+    }
+
+    void verifyPhysicalLoadConsistency(
+        const InstanceData& instance,
+        const SplitCoefficients& splits,
+        const Layout& layout,
+        const SolverResult& solution,
+        const std::vector<FixedLoad>& fixed_loads,
+        bool simple_max_model,
+        double expected_free_max,
+        int lexicographic_iteration,
+        const char* phase) {
+
+        const std::vector<double> physical =
+            actualLoadValues(instance, splits, layout, solution);
+
+        if (physical.size() != layout.load_position.size()) {
+            throw std::logic_error(
+                "physical-load diagnostic vector has wrong size");
+        }
+
+        double largest_free_physical = -kInf;
+        double largest_free_lambda = -kInf;
+
+        int largest_free_physical_t = -1;
+        int largest_free_physical_a = -1;
+
+        int largest_free_lambda_t = -1;
+        int largest_free_lambda_a = -1;
+        int largest_free_lambda_position = -1;
+
+        for (int p = 0;
+            p < static_cast<int>(layout.load_position.size());
+            ++p) {
+
+            const auto [t, a] = layout.load_position[p];
+
+            const int lambda_col =
+                layout.lambda[layout.loadOffset(t, a)];
+
+            if (lambda_col < 0 ||
+                lambda_col >= static_cast<int>(solution.values.size())) {
+
+                throw std::logic_error(
+                    "load diagnostic references invalid lambda column");
+            }
+
+            const double lambda_value =
+                solution.values[lambda_col];
+
+            const double physical_value =
+                physical[p];
+
+            // ---------------------------------------------------------
+            // 1. lambda must equal the actual physical utilization.
+            // ---------------------------------------------------------
+            //
+            // Base load row:
+            //
+            //     capacity * lambda - traffic = 0
+            //
+            // Thus any material lambda/physical discrepancy is a model or
+            // numerical-consistency problem.
+            reportInvariantDifference(
+                std::string(phase) +
+                " lambda vs physical load (t=" +
+                std::to_string(t) +
+                ",a=" +
+                std::to_string(arcNameId(instance, a)) +
+                ")",
+                lambda_value,
+                physical_value);
+
+            // ---------------------------------------------------------
+            // 2. Verify already fixed physical bottlenecks.
+            // ---------------------------------------------------------
+            if (const auto fixed =
+                fixedLoadValue(fixed_loads, t, a)) {
+
+                reportInvariantDifference(
+                    std::string(phase) +
+                    " fixed physical bottleneck (t=" +
+                    std::to_string(t) +
+                    ",a=" +
+                    std::to_string(
+                        arcNameId(instance, a)) +
+                    ")",
+                    physical_value,
+                    *fixed);
+            }
+            else {
+                // -----------------------------------------------------
+                // 3. Track largest still-free physical load.
+                // -----------------------------------------------------
+                if (physical_value > largest_free_physical) {
+                    largest_free_physical =
+                        physical_value;
+
+                    largest_free_physical_t = t;
+                    largest_free_physical_a = a;
+                }
+
+                // -----------------------------------------------------
+                // 4. Track largest still-free lambda value.
+                // -----------------------------------------------------
+                if (lambda_value > largest_free_lambda) {
+                    largest_free_lambda =
+                        lambda_value;
+
+                    largest_free_lambda_t = t;
+                    largest_free_lambda_a = a;
+                    largest_free_lambda_position = p;
+                }
+            }
+        }
+
+        // -------------------------------------------------------------
+        // 5. Diagnostics for the persistent simple-max formulation.
+        // -------------------------------------------------------------
+        if (simple_max_model &&
+            std::isfinite(largest_free_physical) &&
+            std::isfinite(largest_free_lambda)) {
+
+            const double physical_at_largest_lambda =
+                largest_free_lambda_position >= 0
+                ? physical[largest_free_lambda_position]
+                : kInf;
+
+            std::cout
+                << std::setprecision(16)
+                << "\n"
+                << "  PERSISTENT MAX DIAGNOSTIC"
+                << " [iteration "
+                << lexicographic_iteration
+                << ", phase=" << phase << "]\n"
+
+                << "    solver objective z            = "
+                << expected_free_max << "\n"
+
+                << "    largest unfixed lambda        = "
+                << largest_free_lambda
+                << " at (t="
+                << largest_free_lambda_t
+                << ", a="
+                << arcNameId(
+                    instance,
+                    largest_free_lambda_a)
+                << ")\n"
+
+                << "    physical load at that arc     = "
+                << physical_at_largest_lambda
+                << "\n"
+
+                << "    largest unfixed physical load = "
+                << largest_free_physical
+                << " at (t="
+                << largest_free_physical_t
+                << ", a="
+                << arcNameId(
+                    instance,
+                    largest_free_physical_a)
+                << ")\n";
+
+            if (layout.z >= 0 &&
+                layout.z <
+                static_cast<int>(solution.values.size())) {
+
+                std::cout
+                    << "    z variable value              = "
+                    << solution.values[layout.z]
+                    << "\n";
+            }
+
+            std::cout
+                << "    z - max(lambda)               = "
+                << (expected_free_max -
+                    largest_free_lambda)
+                << "\n"
+
+                << "    max(lambda) - max(physical)   = "
+                << (largest_free_lambda -
+                    largest_free_physical)
+                << "\n"
+
+                << "    z - max(physical)             = "
+                << (expected_free_max -
+                    largest_free_physical)
+                << "\n\n";
+
+            // ---------------------------------------------------------
+            // 6. Existing hard invariant:
+            //    objective should equal largest free physical load.
+            // ---------------------------------------------------------
+            reportInvariantDifference(
+                std::string(phase) +
+                " solver objective vs largest physical unfixed load",
+                expected_free_max,
+                largest_free_physical);
+
+            // ---------------------------------------------------------
+            // 7. New invariant:
+            //    objective should also equal largest free lambda.
+            //
+            // If this one passes but the physical one fails, then some
+            // free lambda contains artificial slack.
+            //
+            // If this one fails too, then z is constrained by something
+            // other than the active free-lambda max rows.
+            // ---------------------------------------------------------
+            reportInvariantDifference(
+                std::string(phase) +
+                " solver objective vs largest unfixed lambda",
+                expected_free_max,
+                largest_free_lambda);
+
+            // ---------------------------------------------------------
+            // 8. Existing z-variable consistency check.
+            // ---------------------------------------------------------
+            if (layout.z >= 0 &&
+                layout.z <
+                static_cast<int>(solution.values.size())) {
+
+                reportInvariantDifference(
+                    std::string(phase) +
+                    " solver objective vs z variable",
+                    expected_free_max,
+                    solution.values[layout.z]);
+            }
+
+            // ---------------------------------------------------------
+            // 9. Additional diagnostic:
+            //    with physical load equalities, the largest free lambda must
+            //    correspond to the same physical utilization (up to numerical
+            //    feasibility tolerances).
+            // ---------------------------------------------------------
+            const double slack_at_max_lambda =
+                largest_free_lambda -
+                physical_at_largest_lambda;
+
+            if (slack_at_max_lambda >
+                kInvariantWarningTolerance) {
+
+                std::cerr
+                    << std::setprecision(16)
+                    << "WARNING in " << phase
+                    << " at lexicographic iteration "
+                    << lexicographic_iteration
+                    << ": largest unfixed lambda differs from physical utilization."
+                    << " lambda=" << largest_free_lambda
+                    << ", physical="
+                    << physical_at_largest_lambda
+                    << ", slack="
+                    << slack_at_max_lambda
+                    << ", at (t="
+                    << largest_free_lambda_t
+                    << ", a="
+                    << arcNameId(
+                        instance,
+                        largest_free_lambda_a)
+                    << ")\n";
+            }
+        }
+    }
+
     MipStart makeBaseWarmStart(
         const Layout& layout,
         const Layout& previous_layout,
@@ -1028,12 +1378,13 @@ namespace {
     }
 
 
-    MipStart makeWarmStart(
+    MipStart makeResidualWarmStart(
         const Layout& layout,
         const Layout& previous_layout,
         const SolverResult& previous_solution,
         const std::vector<double>& previous_loads,
-        int k) {
+        int residual_k,
+        const std::vector<FixedLoad>& fixed_loads) {
 
         MipStart warm;
         auto addStart = [&](int column, double value) {
@@ -1071,21 +1422,49 @@ namespace {
             }
         }
 
-        // There are no alpha_1/beta_1 variables. Initialize levels 2..k
-        // from the previous load vector.
-        if (k >= 2 && !previous_loads.empty()) {
-            std::vector<double> sorted = previous_loads;
+        // Build the previous residual load vector in layout.load_position order.
+        std::vector<double> free_previous_loads;
+        std::vector<int> free_positions;
+        free_previous_loads.reserve(layout.load_position.size());
+        free_positions.reserve(layout.load_position.size());
+
+        for (int p = 0;
+            p < static_cast<int>(layout.load_position.size());
+            ++p) {
+
+            const auto [t, a] = layout.load_position[p];
+            if (loadIsFixed(fixed_loads, t, a)) {
+                continue;
+            }
+            if (p >= static_cast<int>(previous_loads.size())) {
+                throw std::logic_error(
+                    "previous load vector is too short for residual warm start");
+            }
+
+            free_positions.push_back(p);
+            free_previous_loads.push_back(previous_loads[p]);
+        }
+
+        if (residual_k >= 2 && !free_previous_loads.empty()) {
+            std::vector<double> sorted = free_previous_loads;
             std::sort(sorted.begin(), sorted.end(), std::greater<double>());
 
-            for (int iteration = 2; iteration <= k; ++iteration) {
+            for (int iteration = 2; iteration <= residual_k; ++iteration) {
                 const int sorted_index = std::min<int>(
-                    iteration - 1, static_cast<int>(sorted.size()) - 1);
+                    iteration - 1,
+                    static_cast<int>(sorted.size()) - 1);
                 const double alpha = sorted[sorted_index];
+
                 addStart(layout.alpha[iteration], alpha);
 
-                for (int p = 0; p < static_cast<int>(previous_loads.size()); ++p) {
-                    addStart(layout.beta[iteration][p],
-                        std::max(0.0, previous_loads[p] - alpha));
+                for (int q = 0;
+                    q < static_cast<int>(free_positions.size());
+                    ++q) {
+
+                    const int p = free_positions[q];
+                    addStart(
+                        layout.beta[iteration][p],
+                        std::max(0.0, free_previous_loads[q] - alpha));
                 }
             }
         }
@@ -1194,6 +1573,54 @@ namespace {
         result.minimum_candidate_load = solution.objective;
         result.solved_optimally = solution.optimal;
 
+        // The temporary objective is supposed to be exactly candidate lambda.
+        // Verify that no stale objective coefficient survived a previous
+        // persistent solve.
+        const double candidate_lambda_value =
+            solution.values.at(static_cast<std::size_t>(candidate_col));
+        reportInvariantDifference(
+            "bottleneck-test ObjVal vs candidate lambda",
+            solution.objective,
+            candidate_lambda_value);
+
+        // Because candidate lambda is minimized and its load row is
+        // capacity*lambda - traffic >= 0, it must be tight at the helper optimum.
+        // Recompute the utilization directly from x and verify this explicitly.
+        const std::vector<double> helper_physical =
+            actualLoadValues(instance, splits, layout, solution);
+        int candidate_position = -1;
+        for (int p = 0;
+            p < static_cast<int>(layout.load_position.size());
+            ++p) {
+            if (layout.load_position[p].first == candidate_time &&
+                layout.load_position[p].second == candidate_arc) {
+                candidate_position = p;
+                break;
+            }
+        }
+        if (candidate_position < 0) {
+            throw std::logic_error(
+                "bottleneck-test candidate missing from load-position vector");
+        }
+
+        const double candidate_physical_load =
+            helper_physical[static_cast<std::size_t>(candidate_position)];
+
+        reportInvariantDifference(
+            "bottleneck-test candidate lambda vs physical load from x",
+            candidate_lambda_value,
+            candidate_physical_load);
+
+        std::cout
+            << std::setprecision(16)
+            << "    proof diagnostics: boundary=" << current_boundary
+            << ", helper ObjVal=" << solution.objective
+            << ", helper lambda=" << candidate_lambda_value
+            << ", physical load=" << candidate_physical_load
+            << ", boundary-helper="
+            << (current_boundary - solution.objective)
+            << '\n';
+
         if (!solution.optimal) {
             std::cout
                 << "    bottleneck test stopped with status " << solution.status
@@ -1201,6 +1628,26 @@ namespace {
                 << solution.objective
                 << "; uniqueness is not proved.\n";
             return result;
+        }
+
+        const double proof_discrepancy =
+            current_boundary - solution.objective;
+
+        if (std::abs(proof_discrepancy) > kBottleneckProofTolerance &&
+            solution.objective >= current_boundary - kTolerance) {
+            std::cerr << std::setprecision(16)
+                << "WARNING: bottleneck would be accepted by the existing "
+                << "kTolerance=" << kTolerance
+                << " rule, but helper differs from the boundary by "
+                << proof_discrepancy
+                << ", which exceeds diagnostic proof tolerance "
+                << kBottleneckProofTolerance << ".\n";
+        }
+
+        if (solution.objective > current_boundary + kInvariantErrorTolerance) {
+            throw std::runtime_error(
+                "bottleneck helper optimum is materially ABOVE the feasible "
+                "current boundary; helper/main models are inconsistent");
         }
 
         result.proved_fixed =
@@ -1227,6 +1674,7 @@ namespace {
     BottleneckTestResult testBottleneckCandidatePersistent(
         opt::SolverSession& session,
         const InstanceData& instance,
+        const SplitCoefficients& splits,
         const TasrSolverOptions& options,
         double remaining_time_seconds,
         double current_boundary,
@@ -1268,6 +1716,13 @@ namespace {
         backend_options.time_limit_seconds = remaining_time_seconds;
         backend_options.mip_relative_gap = options.mip_relative_gap;
         backend_options.solver_output = options.solver_output;
+
+        // One feasible helper solution strictly below this threshold is already
+        // enough to disprove unavoidability.  Ask supported backends (currently
+        // Gurobi) to terminate immediately when such an incumbent appears.
+        backend_options.stop_when_incumbent_below = true;
+        backend_options.incumbent_stop_value =
+            current_boundary - kTolerance;
 
         std::string model_file;
         if (options.write_models) {
@@ -1314,14 +1769,91 @@ namespace {
         result.minimum_candidate_load = solution.objective;
         result.solved_optimally = solution.optimal;
 
+        // The temporary persistent objective must be exactly candidate lambda.
+        // This catches stale objective coefficients left behind by earlier
+        // re-optimizations.
+        const double candidate_lambda_value =
+            solution.values.at(static_cast<std::size_t>(candidate_col));
+        reportInvariantDifference(
+            "persistent bottleneck-test ObjVal vs candidate lambda",
+            solution.objective,
+            candidate_lambda_value);
+
+        // Recompute the helper candidate's physical utilization directly from x.
+        // Minimizing lambda_b should make its load inequality tight.
+        const std::vector<double> helper_physical =
+            actualLoadValues(instance, splits, layout, solution);
+        int candidate_position = -1;
+        for (int p = 0;
+            p < static_cast<int>(layout.load_position.size());
+            ++p) {
+            if (layout.load_position[p].first == candidate_time &&
+                layout.load_position[p].second == candidate_arc) {
+                candidate_position = p;
+                break;
+            }
+        }
+        if (candidate_position < 0) {
+            throw std::logic_error(
+                "persistent bottleneck-test candidate missing from load-position vector");
+        }
+
+        const double candidate_physical_load =
+            helper_physical[static_cast<std::size_t>(candidate_position)];
+
+        reportInvariantDifference(
+            "persistent bottleneck-test candidate lambda vs physical load from x",
+            candidate_lambda_value,
+            candidate_physical_load);
+
+        std::cout
+            << std::setprecision(16)
+            << "    proof diagnostics: boundary=" << current_boundary
+            << ", helper ObjVal=" << solution.objective
+            << ", helper lambda=" << candidate_lambda_value
+            << ", physical load=" << candidate_physical_load
+            << ", boundary-helper="
+            << (current_boundary - solution.objective)
+            << '\n';
+
+        if (solution.incumbent_stop_triggered) {
+            std::cout
+                << "    early helper stop: found feasible candidate load "
+                << std::setprecision(12) << solution.objective
+                << " < rejection threshold "
+                << backend_options.incumbent_stop_value
+                << ". Bottleneck is NOT unavoidable; no optimality proof needed.\n";
+            return result;
+        }
+
         if (!solution.optimal) {
             std::cout
                 << "    persistent bottleneck test stopped with status "
                 << solution.status
                 << " at candidate load "
                 << std::setprecision(12) << solution.objective
-                << "; unavoidability is not proved.\n";
+                << "; unavoidability remains unknown.\n";
             return result;
+        }
+
+        const double proof_discrepancy =
+            current_boundary - solution.objective;
+
+        if (std::abs(proof_discrepancy) > kBottleneckProofTolerance &&
+            solution.objective >= current_boundary - kTolerance) {
+            std::cerr << std::setprecision(16)
+                << "WARNING: bottleneck would be accepted by the existing "
+                << "kTolerance=" << kTolerance
+                << " rule, but helper differs from the boundary by "
+                << proof_discrepancy
+                << ", which exceeds diagnostic proof tolerance "
+                << kBottleneckProofTolerance << ".\n";
+        }
+
+        if (solution.objective > current_boundary + kInvariantErrorTolerance) {
+            throw std::runtime_error(
+                "bottleneck helper optimum is materially ABOVE the feasible "
+                "current boundary; helper/main models are inconsistent");
         }
 
         result.proved_fixed =
@@ -1364,8 +1896,8 @@ namespace {
                         if (col < 0) continue;
 
                         if (segmentLoadLowerBound(
-                                instance, splits, d, t, i, j) >
-                            global_max_cutoff + kFixingTolerance) {
+                            instance, splits, d, t, i, j) >
+                            global_max_cutoff + kLexFixingTolerance) {
                             session.setColumnBounds(col, 0.0, 0.0);
                             ++fixed_to_zero;
                         }
@@ -1392,28 +1924,36 @@ namespace {
 
         const std::size_t offset = layout.loadOffset(time, arc);
         const int lambda = layout.lambda[offset];
-        const int load_row = layout.load_row[offset];
         const int max_row = layout.max_row[offset];
 
-        if (lambda < 0 || load_row < 0 || max_row < 0) {
+        if (lambda < 0 || max_row < 0) {
             throw std::logic_error(
                 "persistent bottleneck references missing model entries");
         }
 
-        // Keep a small numerical window around the solver-produced load value.
+        // The helper has proved that this physical arc/time load is unavoidable.
+        // Keep a small numerical window around the solver-produced value.
         session.setColumnBounds(
             lambda,
             std::max(0.0, value - kLexFixingTolerance),
             value + kLexFixingTolerance);
 
-        // A fixed lambda alone could contain slack because the base load row is
-        // capacity*lambda - traffic >= 0. Turn that row into an equality so the
-        // fixed bottleneck remains a physical routed load, not just an artificial
-        // lambda value.
-        session.setRowBounds(load_row, 0.0, 0.0);
-
-        // Remove this already-peeled load from z >= lambda without deleting or
-        // renumbering anything. The row becomes simply z >= 0.
+        // Every load row is already an equality:
+        //
+        //     capacity * lambda - routed_traffic = 0.
+        //
+        // Therefore no load-row modification is required here.
+        //
+        // Peel this bottleneck from the next max objective by changing
+        //
+        //     z - lambda >= 0
+        //
+        // into
+        //
+        //     z >= 0.
+        //
+        // Removing only the lambda coefficient keeps the native row numbering
+        // stable and avoids using GRB_INFINITY as an artificial RHS.
         session.setCoefficient(max_row, lambda, 0.0);
     }
 
@@ -1573,7 +2113,7 @@ TasrSolution TasrSolver::solve() {
     auto elapsedSeconds = [&]() {
         return std::chrono::duration<double>(
             Clock::now() - process_start).count();
-    };
+        };
 
     auto remainingSeconds = [&]() {
         if (options_.time_limit_seconds <= 0.0) {
@@ -1582,12 +2122,12 @@ TasrSolution TasrSolver::solve() {
         return std::max(
             0.0,
             options_.time_limit_seconds - elapsedSeconds());
-    };
+        };
 
     auto budgetExpired = [&]() {
         return options_.time_limit_seconds > 0.0 &&
             remainingSeconds() <= 0.0;
-    };
+        };
 
     const int total_loads = [&]() {
         int count = 0;
@@ -1597,7 +2137,7 @@ TasrSolution TasrSolver::solve() {
             }
         }
         return count;
-    }();
+        }();
 
     if (total_loads == 0) {
         throw std::runtime_error(
@@ -1623,6 +2163,14 @@ TasrSolution TasrSolver::solve() {
 
     std::vector<FixedLoad> fixed_bottlenecks;
     bool bottleneck_peeling_active = true;
+
+    // Once individual bottleneck peeling fails, all subsequently optimized
+    // levels belong to the residual vector of still-unfixed loads. The first
+    // residual maximum was already obtained by the final simple-max solve.
+    bool residual_ksum_active = false;
+    int residual_fixed_prefix = -1;
+    double residual_prefix_objective = 0.0;
+    double residual_max_boundary = kInf;
 
     Layout best_layout;
     SolverResult best_solution;
@@ -1674,7 +2222,7 @@ TasrSolution TasrSolver::solve() {
         const bool use_simple_max =
             (k == 1) ||
             (bottleneck_peeling_active &&
-             static_cast<int>(fixed_bottlenecks.size()) == k - 1);
+                static_cast<int>(fixed_bottlenecks.size()) == k - 1);
 
         const double global_max_cutoff =
             (k == 1)
@@ -1781,17 +2329,58 @@ TasrSolution TasrSolver::solve() {
                 model_file);
         }
         else {
-            // If peeling failed, fall back to the original exact k-sum model.
-            // This path is rebuilt because its alpha/beta structure grows with k.
+            // Individual peeling has stopped. Work only on the residual vector
+            // of still-unfixed loads. If m loads were fixed before the switch,
+            // global iteration k corresponds to residual order q = k-m.
+            if (!residual_ksum_active || residual_fixed_prefix < 0) {
+                throw std::logic_error(
+                    "general residual k-sum requested without initialized "
+                    "residual fallback state");
+            }
+
+            const int residual_k = k - residual_fixed_prefix;
+            if (residual_k < 2) {
+                throw std::logic_error(
+                    "residual k-sum fallback requires residual order >= 2");
+            }
+
+            std::vector<double> previous_residual_objectives;
+            previous_residual_objectives.reserve(
+                static_cast<std::size_t>(residual_k - 1));
+
+            // Residual cumulative objective R_j equals the global cumulative
+            // objective S_{m+j} minus the already-fixed prefix S_m.
+            for (int residual_iteration = 1;
+                residual_iteration < residual_k;
+                ++residual_iteration) {
+
+                const int global_level =
+                    residual_fixed_prefix + residual_iteration;
+                if (global_level <= 0 ||
+                    global_level >
+                    static_cast<int>(previous_objectives.size())) {
+                    throw std::logic_error(
+                        "missing global objective for residual fallback");
+                }
+
+                previous_residual_objectives.push_back(
+                    previous_objectives[
+                        static_cast<std::size_t>(global_level - 1)] -
+                    residual_prefix_objective);
+            }
+
             ModelBuilder builder;
 
+            // Segment pruning still uses the GLOBAL maximum L_1. In contrast,
+            // every unfixed lambda can now use the much stronger bound R_1,
+            // the last simple-max optimum before peeling failed.
             addBaseVariables(
                 builder,
                 instance_,
                 splits_,
                 layout,
                 global_max_cutoff,
-                global_max_cutoff,
+                residual_max_boundary,
                 fixed_bottlenecks);
             addBaseConstraints(
                 builder,
@@ -1799,12 +2388,13 @@ TasrSolution TasrSolver::solve() {
                 splits_,
                 layout,
                 fixed_bottlenecks);
-            addKSumObjective(
+            addResidualKSumObjective(
                 builder,
                 instance_,
                 layout,
-                k,
-                previous_objectives);
+                residual_k,
+                previous_residual_objectives,
+                fixed_bottlenecks);
 
             if (opt::interruptRequested() || budgetExpired()) {
                 std::cout
@@ -1817,12 +2407,16 @@ TasrSolution TasrSolver::solve() {
             const MipStart* warm_start_ptr = nullptr;
 
             if (have_previous_solution) {
-                warm_start = makeWarmStart(
+                const int residual_k =
+                    k - residual_fixed_prefix;
+
+                warm_start = makeResidualWarmStart(
                     layout,
                     previous_layout,
                     previous_solution,
                     previous_loads,
-                    k);
+                    residual_k,
+                    fixed_bottlenecks);
                 warm_start_ptr = &warm_start;
             }
 
@@ -1832,18 +2426,37 @@ TasrSolution TasrSolver::solve() {
                 name << options_.model_prefix << "-"
                     << opt::solverTypeName(options_.solver)
                     << "-lex-" << k
-                    << "-general-ksum.lp";
+                    << "-residual-ksum.lp";
                 model_file = name.str();
             }
 
             displayed_columns = builder.numColumns();
             displayed_rows = builder.numRows();
 
+            const int residual_k_for_log =
+                k - residual_fixed_prefix;
+            const int residual_free_loads =
+                static_cast<int>(layout.load_position.size()) -
+                residual_fixed_prefix;
+
+            std::cout
+                << "  Residual k-sum setup: fixed prefix m="
+                << residual_fixed_prefix
+                << ", residual order q="
+                << residual_k_for_log
+                << ", residual max bound R_1="
+                << std::setprecision(12)
+                << residual_max_boundary
+                << ", unfixed loads="
+                << residual_free_loads
+                << "\n";
+
             std::cout
                 << "Lexicographic iteration " << k << '/'
                 << requested_iterations << " with "
                 << opt::solverTypeName(options_.solver)
-                << " [general k-sum fallback]: "
+                << " [residual k-sum fallback, residual order "
+                << (k - residual_fixed_prefix) << "]: "
                 << displayed_columns << " columns, "
                 << displayed_rows << " rows"
                 << ", remaining total time = " << std::fixed
@@ -1889,6 +2502,21 @@ TasrSolution TasrSolver::solve() {
         const std::vector<double> candidate_loads =
             loadValues(layout, solution);
 
+        // Cross-check the native solver result against loads recomputed directly
+        // from the binary routing decisions. For peeled min-max iterations this
+        // also detects stale objective coefficients or an accidentally disabled
+        // max row.
+        verifyPhysicalLoadConsistency(
+            instance_,
+            splits_,
+            layout,
+            solution,
+            fixed_bottlenecks,
+            use_simple_max,
+            solution.objective,
+            k,
+            "main lexicographic solve");
+
         if (!have_best_full_solution ||
             lexicographicallyBetterLoads(candidate_loads, best_loads)) {
             best_layout = layout;
@@ -1917,13 +2545,68 @@ TasrSolution TasrSolver::solve() {
                 current_component;
         }
         else {
-            cumulative_objective = solution.objective;
+            // The fallback objective is the residual ordered sum R_q over only
+            // the still-unfixed loads. Convert it back to the global cumulative
+            // objective S_k by adding the already-fixed prefix S_m.
+            cumulative_objective =
+                residual_prefix_objective + solution.objective;
+
             const double previous_sum =
                 previous_objectives.empty()
                 ? 0.0
                 : previous_objectives.back();
+
             current_component =
                 cumulative_objective - previous_sum;
+        }
+
+        // Ordered loads must be non-increasing:
+        //     L_1 >= L_2 >= ... >= L_k.
+        // A material increase means the current model is no longer representing
+        // the intended lexicographic sequence (for example because previously
+        // preserved levels and solver feasibility tolerances became inconsistent).
+        if (!lexicographic_load_values.empty()) {
+            const double previous_component = lexicographic_load_values.back();
+            if (current_component >
+                previous_component + kLexTolerance) {
+
+                std::ostringstream message;
+                message << std::setprecision(16)
+                    << "LEXICOGRAPHIC INVARIANT ERROR: ordered load increased at "
+                    << "iteration " << k
+                    << ": L_" << (k - 1) << "=" << previous_component
+                    << ", L_" << k << "=" << current_component
+                    << ", increase=" << (current_component - previous_component)
+                    << " > lexicographic tolerance " << kLexTolerance;
+                throw std::runtime_error(message.str());
+            }
+        }
+
+        // The sum of the k largest loads cannot decrease as k grows.
+        if (!previous_objectives.empty()) {
+            const double previous_cumulative = previous_objectives.back();
+            if (cumulative_objective + kLexTolerance <
+                previous_cumulative) {
+
+                std::ostringstream message;
+                message << std::setprecision(16)
+                    << "LEXICOGRAPHIC INVARIANT ERROR: cumulative ordered-load "
+                    << "objective decreased at iteration " << k
+                    << ": previous=" << previous_cumulative
+                    << ", current=" << cumulative_objective
+                    << ", decrease="
+                    << (previous_cumulative - cumulative_objective)
+                    << " > lexicographic tolerance " << kLexTolerance;
+                throw std::runtime_error(message.str());
+            }
+        }
+
+        if (current_component < -kLexTolerance) {
+            std::ostringstream message;
+            message << std::setprecision(16)
+                << "LEXICOGRAPHIC INVARIANT ERROR: negative ordered load at "
+                << "iteration " << k << ": " << current_component;
+            throw std::runtime_error(message.str());
         }
 
         previous_objectives.push_back(cumulative_objective);
@@ -1936,7 +2619,7 @@ TasrSolution TasrSolver::solve() {
 
         std::cout
             << "  optimal ordered load L_" << k << " = "
-            << std::setprecision(12) << current_component << '\n'
+            << std::setprecision(16) << current_component << '\n'
             << "  cumulative objective (sum of " << k
             << " largest loads) = "
             << cumulative_objective << '\n';
@@ -1969,12 +2652,30 @@ TasrSolution TasrSolver::solve() {
                     layout,
                     solution);
 
+            // In a simple-max iteration the optimized component must equal the
+            // largest physical load among the still-unfixed arc/time pairs.
+            double largest_unfixed_physical = -kInf;
+            for (int p = 0;
+                p < static_cast<int>(layout.load_position.size());
+                ++p) {
+                const auto [t, a] = layout.load_position[p];
+                if (loadIsFixed(fixed_bottlenecks, t, a)) continue;
+                largest_unfixed_physical =
+                    std::max(largest_unfixed_physical, actual_loads[p]);
+            }
+            if (std::isfinite(largest_unfixed_physical)) {
+                reportInvariantDifference(
+                    "pre-proof ordered component vs largest physical unfixed load",
+                    current_component,
+                    largest_unfixed_physical);
+            }
+
             int candidate_position = -1;
             double candidate_actual_load = -kInf;
 
             for (int p = 0;
-                 p < static_cast<int>(layout.load_position.size());
-                 ++p) {
+                p < static_cast<int>(layout.load_position.size());
+                ++p) {
 
                 const auto [t, a] = layout.load_position[p];
                 if (loadIsFixed(fixed_bottlenecks, t, a)) {
@@ -2017,6 +2718,7 @@ TasrSolution TasrSolver::solve() {
                         testBottleneckCandidatePersistent(
                             *persistent_session,
                             instance_,
+                            splits_,
                             options_,
                             remainingSeconds(),
                             current_component,
@@ -2051,13 +2753,38 @@ TasrSolution TasrSolver::solve() {
                             << "re-optimized for the next level.\n";
                     }
                     else {
+                        // We have fixed exactly the prefix L_1,...,L_m, while
+                        // the current simple-max iteration has just optimized
+                        // R_1 = L_{m+1} over all remaining loads. Preserve this
+                        // residual maximum directly through lambda upper bounds
+                        // in every subsequent residual k-sum model.
+                        residual_fixed_prefix =
+                            static_cast<int>(fixed_bottlenecks.size());
+
+                        residual_prefix_objective =
+                            residual_fixed_prefix > 0
+                            ? previous_objectives.at(
+                                static_cast<std::size_t>(
+                                    residual_fixed_prefix - 1))
+                            : 0.0;
+
+                        residual_max_boundary = current_component;
+                        residual_ksum_active = true;
+
                         bottleneck_peeling_active = false;
                         persistent_session.reset();
 
                         std::cout
                             << "    Bottleneck cannot be fixed individually. "
-                            << "Persistent peeling stops; the next iteration "
-                            << "will use the general k-sum formulation.\n";
+                            << "Persistent peeling stops. The next iteration "
+                            << "uses a residual k-sum formulation over only the "
+                            << "unfixed loads.\n"
+                            << "    Fixed prefix length m = "
+                            << residual_fixed_prefix
+                            << ", residual R_1 = "
+                            << std::setprecision(12)
+                            << residual_max_boundary
+                            << ".\n";
                     }
                 }
             }

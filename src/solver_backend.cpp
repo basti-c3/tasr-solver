@@ -581,13 +581,46 @@ namespace opt {
             return environment.get();
         }
 
-        int __stdcall gurobiInterruptCallback(GRBmodel* model,
-            void* /*cbdata*/,
-            int /*where*/,
-            void* /*usrdata*/) {
+        struct GurobiCallbackData {
+            bool stop_when_incumbent_below = false;
+            double incumbent_stop_value = -kInfinity;
+            bool incumbent_stop_triggered = false;
+        };
+
+        int __stdcall gurobiInterruptCallback(
+            GRBmodel* model,
+            void* cbdata,
+            int where,
+            void* usrdata) {
+
+            auto* data = static_cast<GurobiCallbackData*>(usrdata);
+
             if (interruptRequested()) {
                 GRBterminate(model);
+                return 0;
             }
+
+            // For a minimization MIP, one feasible incumbent below the helper's
+            // rejection threshold is enough to prove that the tested bottleneck
+            // is NOT unavoidable.  There is no need to prove optimality.
+            if (data &&
+                data->stop_when_incumbent_below &&
+                where == GRB_CB_MIPSOL) {
+
+                double incumbent_objective = 0.0;
+                const int error = GRBcbget(
+                    cbdata,
+                    where,
+                    GRB_CB_MIPSOL_OBJ,
+                    &incumbent_objective);
+
+                if (error == 0 &&
+                    incumbent_objective < data->incumbent_stop_value) {
+                    data->incumbent_stop_triggered = true;
+                    GRBterminate(model);
+                }
+            }
+
             return 0;
         }
 
@@ -724,11 +757,17 @@ namespace opt {
                     "writing model to '" + model_file + "'");
             }
 
+            GurobiCallbackData callback_data;
+            callback_data.stop_when_incumbent_below =
+                options.stop_when_incumbent_below;
+            callback_data.incumbent_stop_value =
+                options.incumbent_stop_value;
+
             checkGurobi(
                 env,
                 GRBsetcallbackfunc(
-                    grb_model.get(), gurobiInterruptCallback, nullptr),
-                "setting interrupt callback");
+                    grb_model.get(), gurobiInterruptCallback, &callback_data),
+                "setting interrupt/early-stop callback");
 
             checkGurobi(
                 env,
@@ -752,7 +791,11 @@ namespace opt {
             result.status = gurobiStatusString(status);
             result.optimal = status == GRB_OPTIMAL;
             result.time_limit_reached = status == GRB_TIME_LIMIT;
-            result.interrupted = status == GRB_INTERRUPTED || interruptRequested();
+            result.incumbent_stop_triggered =
+                callback_data.incumbent_stop_triggered;
+            result.interrupted =
+                (status == GRB_INTERRUPTED || interruptRequested()) &&
+                !result.incumbent_stop_triggered;
             result.feasible = solution_count > 0;
 
             if (result.feasible) {
@@ -887,11 +930,6 @@ namespace opt {
                     GRBupdatemodel(model_.get()),
                     "updating persistent Gurobi model");
 
-                checkGurobi(
-                    env_,
-                    GRBsetcallbackfunc(
-                        model_.get(), gurobiInterruptCallback, nullptr),
-                    "setting persistent interrupt callback");
             }
 
             SolverResult optimize(
@@ -940,8 +978,57 @@ namespace opt {
                             : GRB_INFINITY),
                     "setting TimeLimit");
 
+                // Explicit user MIP starts persist on a Gurobi model across
+                // optimize() calls.  For our persistent T-ASR model that is not
+                // what we want: the common-routing start is intended only for the
+                // first full solve.  Later solves should reuse Gurobi's incumbent
+                // from the previous optimization automatically.
+                //
+                // Therefore discard every previously stored explicit start before
+                // each solve.  This does NOT reset the model or its incumbent.
+                checkGurobi(
+                    env_,
+                    GRBsetintattr(
+                        model_.get(),
+                        "NumStart",
+                        0),
+                    "discarding stale persistent Gurobi MIP starts");
+
+                checkGurobi(
+                    env_,
+                    GRBupdatemodel(model_.get()),
+                    "updating persistent Gurobi model after clearing MIP starts");
+                GRBenv* model_env = GRBgetenv(model_.get());
+
+                checkGurobi(
+                    model_env,
+                    GRBsetintparam(
+                        model_env,
+                        "DualReductions",
+                        0),
+                    "setting DualReductions");
+                // If this particular solve intentionally supplies a fresh start,
+                // create exactly one new start and populate only the supplied
+                // entries.  Unspecified entries remain undefined.
                 if (mip_start && !mip_start->empty()) {
                     validateMipStart(*mip_start, num_columns_);
+
+                    checkGurobi(
+                        env_,
+                        GRBsetintattr(
+                            model_.get(),
+                            "NumStart",
+                            1),
+                        "creating fresh persistent Gurobi MIP start");
+
+                    checkGurobi(
+                        env_,
+                        GRBsetintparam(
+                            env_,
+                            "StartNumber",
+                            0),
+                        "selecting persistent Gurobi MIP start 0");
+
                     for (std::size_t p = 0;
                          p < mip_start->index.size();
                          ++p) {
@@ -968,6 +1055,20 @@ namespace opt {
                         "writing persistent model to '" + model_file + "'");
                 }
 
+                GurobiCallbackData callback_data;
+                callback_data.stop_when_incumbent_below =
+                    options.stop_when_incumbent_below;
+                callback_data.incumbent_stop_value =
+                    options.incumbent_stop_value;
+
+                checkGurobi(
+                    env_,
+                    GRBsetcallbackfunc(
+                        model_.get(),
+                        gurobiInterruptCallback,
+                        &callback_data),
+                    "setting persistent interrupt/early-stop callback");
+
                 checkGurobi(
                     env_,
                     GRBoptimize(model_.get()),
@@ -990,8 +1091,11 @@ namespace opt {
                 result.status = gurobiStatusString(status);
                 result.optimal = status == GRB_OPTIMAL;
                 result.time_limit_reached = status == GRB_TIME_LIMIT;
+                result.incumbent_stop_triggered =
+                    callback_data.incumbent_stop_triggered;
                 result.interrupted =
-                    status == GRB_INTERRUPTED || interruptRequested();
+                    (status == GRB_INTERRUPTED || interruptRequested()) &&
+                    !result.incumbent_stop_triggered;
                 result.feasible = solution_count > 0;
 
                 if (result.feasible) {
@@ -1075,9 +1179,26 @@ namespace opt {
                         sense = GRB_LESS_EQUAL;
                         rhs = upper;
                     }
+                    else if (!finite_lower && !finite_upper) {
+                        // A completely free generic row has no direct Gurobi
+                        // constraint representation. Keep the native row in place
+                        // so that persistent row indices remain stable, but make it
+                        // redundant.
+                        //
+                        //     lhs <= GRB_INFINITY
+                        //
+                        // This is equivalent to removing the row for our purposes,
+                        // without deleting a native constraint and renumbering the
+                        // persistent model.
+                        sense = GRB_LESS_EQUAL;
+                        rhs = GRB_INFINITY;
+                    }
                     else {
+                        // A single native Gurobi constraint cannot represent a
+                        // genuine two-sided range lower <= lhs <= upper.
                         throw std::logic_error(
-                            "unsupported persistent Gurobi row-bound change");
+                            "cannot change single persistent Gurobi row to "
+                            "a finite two-sided range");
                     }
 
                     checkGurobi(
@@ -1085,11 +1206,13 @@ namespace opt {
                         GRBsetcharattrelement(
                             model_.get(), "Sense", native[0], sense),
                         "changing persistent Gurobi row sense");
+
                     checkGurobi(
                         env_,
                         GRBsetdblattrelement(
                             model_.get(), "RHS", native[0], rhs),
                         "changing persistent Gurobi row RHS");
+
                     return;
                 }
 
