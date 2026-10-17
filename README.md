@@ -14,7 +14,7 @@ solve T-ASR by:
 * selecting segment paths with a sparse MILP containing flow, degree,
 maximum-segment, reconfiguration-budget, and exact arc-utilization constraints;
 * lexicographically minimizing the sorted arc–time utilization vector, using
-persistent bottleneck peeling and a residual ordered-$k$-sum formulation when peeling fails; and
+persistent bottleneck peeling and a residual ordered-k-sum formulation when peeling fails; and
 * supporting both HiGHS and Gurobi through a solver-independent model interface.
 
 ## Status
